@@ -138,14 +138,23 @@ global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
 
-# Deteksi otomatis simbol Kconfig untuk Manual Hook di BakaSU
-manual_syms = set(["KSU_MANUAL_HOOK"])
-disable_syms = set(["KSU_WITH_KPROBES", "KSU_TRACEPOINT_HOOK", "KSU_SUSFS", "KSU_LKM"])
+# Konfigurasi Kconfig BakaSU: Manual Hook aktif + Auto Setuid via LSM, tanpa auto initrc/input
+manual_syms = set(["KSU_MANUAL_HOOK", "KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
+disable_syms = set([
+    "KSU_WITH_KPROBES",
+    "KSU_TRACEPOINT_HOOK",
+    "KSU_SUSFS",
+    "KSU_LKM",
+    "KSU_MANUAL_HOOK_AUTO_INITRC_HOOK",
+    "KSU_MANUAL_HOOK_AUTO_INPUT_HOOK",
+])
 for kc_file in ksu_dir.rglob("Kconfig*"):
     ktxt = kc_file.read_text(errors="ignore")
     for m in re.finditer(r'^\s*config\s+([A-Z0-9_]+)', ktxt, re.M):
         sym = m.group(1)
-        if "MANUAL" in sym and "HOOK" in sym:
+        if sym in disable_syms or sym in manual_syms:
+            continue
+        if "MANUAL" in sym and "HOOK" in sym and "AUTO" not in sym:
             manual_syms.add(sym)
         elif any(x in sym for x in ("KPROBE", "TRACEPOINT", "SUSFS", "LKM")):
             disable_syms.add(sym)
@@ -439,33 +448,50 @@ if kc_path.exists():
 EOF
 fi
 
-# 3. Terapkan Manual Hooks BakaSU untuk kernel non-GKI 4.4
+# 3. Terapkan Manual Hooks BakaSU secara aman (cek simbol yang tersedia di drivers/kernelsu)
 echo "[INFO] Memasang manual hooks pada fs/ dan drivers/input/..."
 python3 - << 'EOF'
 import pathlib, re
 
+ksu_all = "\n".join(p.read_text(errors="ignore") for p in pathlib.Path("drivers/kernelsu").rglob("*.c"))
+def has_sym(sym):
+    return bool(re.search(rf'\b{re.escape(sym)}\b', ksu_all))
+
 # Hook 1: fs/exec.c
 exec_p = pathlib.Path("fs/exec.c")
-if exec_p.exists():
+if exec_p.exists() and has_sym("ksu_handle_execveat"):
     txt = exec_p.read_text()
     if "ksu_handle_execveat" not in txt:
-        decl = (
-            "#ifdef CONFIG_KSU\n"
-            "extern bool ksu_execveat_hook __read_mostly;\n"
-            "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
-            "                               void *envp, int *flags);\n"
-            "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n"
-            "                                        void *argv, void *envp, int *flags);\n"
-            "#endif\n"
-        )
-        hook = (
-            "#ifdef CONFIG_KSU\n"
-            "\tif (unlikely(ksu_execveat_hook))\n"
-            "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
-            "\telse\n"
-            "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
-            "#endif\n"
-        )
+        if has_sym("ksu_execveat_hook") and has_sym("ksu_handle_execveat_sucompat"):
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern bool ksu_execveat_hook __read_mostly;\n"
+                "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
+                "                               void *envp, int *flags);\n"
+                "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n"
+                "                                        void *argv, void *envp, int *flags);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tif (unlikely(ksu_execveat_hook))\n"
+                "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                "\telse\n"
+                "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
+                "#endif\n"
+            )
+        else:
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
+                "                               void *envp, int *flags);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                "#endif\n"
+            )
         txt = re.sub(r'(static\s+int\s+do_execveat_common\s*\()', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*IS_ERR\s*\(\s*filename\s*\)\s*\))', "\n" + hook + r'\1', txt, count=1)
         exec_p.write_text(txt)
@@ -473,7 +499,7 @@ if exec_p.exists():
 
 # Hook 2: fs/open.c
 open_p = pathlib.Path("fs/open.c")
-if open_p.exists():
+if open_p.exists() and has_sym("ksu_handle_faccessat"):
     txt = open_p.read_text()
     if "ksu_handle_faccessat" not in txt:
         decl = (
@@ -494,22 +520,35 @@ if open_p.exists():
 
 # Hook 3: fs/read_write.c
 rw_p = pathlib.Path("fs/read_write.c")
-if rw_p.exists():
+if rw_p.exists() and has_sym("ksu_handle_vfs_read"):
     txt = rw_p.read_text()
     if "ksu_handle_vfs_read" not in txt:
-        decl = (
-            "#ifdef CONFIG_KSU\n"
-            "extern bool ksu_vfs_read_hook __read_mostly;\n"
-            "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n"
-            "                               size_t *count_ptr, loff_t **pos);\n"
-            "#endif\n"
-        )
-        hook = (
-            "#ifdef CONFIG_KSU\n"
-            "\tif (unlikely(ksu_vfs_read_hook))\n"
-            "\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
-            "#endif\n"
-        )
+        if has_sym("ksu_vfs_read_hook"):
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern bool ksu_vfs_read_hook __read_mostly;\n"
+                "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n"
+                "                               size_t *count_ptr, loff_t **pos);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tif (unlikely(ksu_vfs_read_hook))\n"
+                "\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
+                "#endif\n"
+            )
+        else:
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n"
+                "                               size_t *count_ptr, loff_t **pos);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
+                "#endif\n"
+            )
         txt = re.sub(r'(ssize_t\s+vfs_read\s*\()', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*!\s*\(\s*file->f_mode\s*&\s*FMODE_READ\s*\)\s*\))', "\n" + hook + r'\1', txt, count=1)
         rw_p.write_text(txt)
@@ -517,7 +556,7 @@ if rw_p.exists():
 
 # Hook 4: fs/stat.c
 stat_p = pathlib.Path("fs/stat.c")
-if stat_p.exists():
+if stat_p.exists() and has_sym("ksu_handle_stat"):
     txt = stat_p.read_text()
     if "ksu_handle_stat" not in txt:
         decl = (
@@ -537,21 +576,33 @@ if stat_p.exists():
 
 # Hook 5: drivers/input/input.c
 inp_p = pathlib.Path("drivers/input/input.c")
-if inp_p.exists():
+if inp_p.exists() and has_sym("ksu_handle_input_handle_event"):
     txt = inp_p.read_text()
     if "ksu_handle_input_handle_event" not in txt:
-        decl = (
-            "#ifdef CONFIG_KSU\n"
-            "extern bool ksu_input_hook __read_mostly;\n"
-            "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
-            "#endif\n"
-        )
-        hook = (
-            "#ifdef CONFIG_KSU\n"
-            "\tif (unlikely(ksu_input_hook))\n"
-            "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
-            "#endif\n"
-        )
+        if has_sym("ksu_input_hook"):
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern bool ksu_input_hook __read_mostly;\n"
+                "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tif (unlikely(ksu_input_hook))\n"
+                "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                "#endif\n"
+            )
+        else:
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                "#endif\n"
+            )
         txt = re.sub(r'(void\s+input_event\s*\()', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*is_event_supported\s*\(\s*type\s*,)', "\n" + hook + r'\1', txt, count=1)
         inp_p.write_text(txt)
@@ -603,6 +654,8 @@ def parse_call_args(code, func_name):
         elif func_name == "__vfs_getxattr" and len(args) >= 5:
             size_arg = re.sub(r'\bFLAGS_VAL\b', '', args[4]).strip()
             out.append(f"vfs_getxattr({args[0]}, {args[2]}, {args[3]}, {size_arg})")
+        elif func_name == "vfs_getattr" and len(args) == 4:
+            out.append(f"vfs_getattr({args[0]}, {args[1]})")
         else:
             out.append(code[m.start():j])
         i = j
@@ -613,6 +666,15 @@ if h_path.exists():
     h = h_path.read_text()
     if "<linux/compat.h>" not in h:
         h = "#include <linux/compat.h>\n" + h
+    compat_macros = (
+        "#ifndef current_time\n"
+        "#define current_time(inode) (CURRENT_TIME)\n"
+        "#endif\n"
+        "#ifndef strscpy\n"
+        "#define strscpy(dst, src, size) strlcpy((dst), (src), (size))\n"
+        "#endif\n"
+    )
+    h = compat_macros + h
     h = h.replace("in_compat_syscall()", "is_compat_task()")
     h = h.replace("iterate_shared", "iterate")
     h = parse_call_args(h, "full_name_hash")
@@ -635,6 +697,7 @@ if c_path.exists():
     c = c.replace("iterate_shared", "iterate")
     c = parse_call_args(c, "full_name_hash")
     c = parse_call_args(c, "__vfs_getxattr")
+    c = parse_call_args(c, "vfs_getattr")
 
     c = re.sub(
         r'(static\s+int\s+nm_\w*rename\s*\([^)]*?),\s*unsigned\s+int\s+flags\s*\)\s*\{',
@@ -703,7 +766,7 @@ for cfg in \
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 7. Siapkan variabel build tunggal agar konsisten di prepare, check, & full build
+# 7. Siapkan variabel build tunggal & generate header (compile.h + flask.h) sebelum cek KSU
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
@@ -722,8 +785,8 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 make "${MAKE_ARGS[@]}" prepare
+make -j"$(nproc --all)" "${MAKE_ARGS[@]}" init/ security/selinux/
 
-# Cek seluruh 38 objek drivers/kernelsu/ sekaligus dengan -k sebelum build penuh
 if ! make -k -j"$(nproc --all)" "${MAKE_ARGS[@]}" drivers/kernelsu/ 2>&1 | tee /tmp/ksu_check.log; then
     echo "================ ALL REMAINING BAKASU ERRORS ================"
     grep -n -C 2 -E ":\s*(fatal )?error:" /tmp/ksu_check.log || true
