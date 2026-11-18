@@ -18,9 +18,28 @@ jobs:
       - name: Download Clang Toolchain
         run: |
           mkdir -p clang
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz -O clang.tar.gz
-          tar -xzf clang.tar.gz -C clang
-          rm -f clang.tar.gz
+          CLANG_OK=0
+          for i in 1 2 3 4 5; do
+            echo "[INFO] Mengunduh Clang r383902 (percobaan $i/5)..."
+            rm -f clang.tar.gz
+            if curl -fSL --connect-timeout 30 --max-time 300 \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz" \
+              -o clang.tar.gz && tar -tzf clang.tar.gz >/dev/null 2>&1; then
+              tar -xzf clang.tar.gz -C clang
+              rm -f clang.tar.gz
+              CLANG_OK=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$CLANG_OK" -ne 1 ]; then
+            echo "[WARN] Server Google memutus unduhan, beralih ke Clang bawaan Ubuntu..."
+            sudo apt-get install -y clang lld llvm
+            mkdir -p clang/bin
+            for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+              [ -x "/usr/bin/$tool" ] && ln -sf "/usr/bin/$tool" "clang/bin/$tool"
+            done
+          fi
 
       - name: Jalankan Build 4.4 BakaSU + NoMount
         run: |
