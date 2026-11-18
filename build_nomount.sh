@@ -703,24 +703,28 @@ for cfg in \
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 7. Compile khusus drivers/kernelsu/ dengan -k dulu agar semua sisa error tampil sekaligus
+# 7. Siapkan variabel build tunggal agar konsisten di prepare, check, & full build
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
 export KBUILD_BUILD_USER="XtRs"
 export KBUILD_BUILD_HOST="Lavender"
 
-make O=out ARCH=arm64 "$DEFCONFIG"
-make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- prepare
+MAKE_ARGS=(
+    O=out
+    ARCH=arm64
+    CC=clang
+    CLANG_TRIPLE=aarch64-linux-gnu-
+    CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    KCFLAGS="-Wno-error"
+)
 
-if ! make -k -j"$(nproc --all)" O=out \
-    ARCH=arm64 \
-    CC=clang \
-    CLANG_TRIPLE=aarch64-linux-gnu- \
-    CROSS_COMPILE=aarch64-linux-gnu- \
-    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-    KCFLAGS="-Wno-error" \
-    drivers/kernelsu/ 2>&1 | tee /tmp/ksu_check.log; then
+make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+make "${MAKE_ARGS[@]}" prepare
+
+# Cek seluruh 38 objek drivers/kernelsu/ sekaligus dengan -k sebelum build penuh
+if ! make -k -j"$(nproc --all)" "${MAKE_ARGS[@]}" drivers/kernelsu/ 2>&1 | tee /tmp/ksu_check.log; then
     echo "================ ALL REMAINING BAKASU ERRORS ================"
     grep -n -C 2 -E ":\s*(fatal )?error:" /tmp/ksu_check.log || true
     echo "============================================================="
@@ -728,13 +732,7 @@ if ! make -k -j"$(nproc --all)" O=out \
 fi
 
 # 8. Lanjutkan full build kernel 4.4 sdm660 hingga selesai
-if ! make -j"$(nproc --all)" O=out \
-    ARCH=arm64 \
-    CC=clang \
-    CLANG_TRIPLE=aarch64-linux-gnu- \
-    CROSS_COMPILE=aarch64-linux-gnu- \
-    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-    KCFLAGS="-Wno-error" 2>&1 | tee /tmp/build.log; then
+if ! make -j"$(nproc --all)" "${MAKE_ARGS[@]}" 2>&1 | tee /tmp/build.log; then
     echo "================ EXACT COMPILER ERRORS ================"
     grep -n -C 4 -E ":\s*(fatal )?error:" /tmp/build.log | tail -n 50 || true
     echo "======================================================="
