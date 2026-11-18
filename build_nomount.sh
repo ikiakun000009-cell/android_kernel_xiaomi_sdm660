@@ -38,15 +38,104 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU (arm64), shim header, & tambalan LSM/VFS Linux 4.4.302
+# 3. Integrasi NoMount (branch dev) sebelum konfigurasi defconfig
+if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ fs/ drivers/ 2>/dev/null; then
+    echo "[INFO] Memasang NoMount (branch dev)..."
+    curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
+fi
+
+# 4. Atur Kconfig BakaSU (Manual Hook + Auto Setuid) & NoMount di defconfig
+python3 - << 'EOF' "$DEFCONFIG_PATH"
+import pathlib, re, sys
+
+defcfg_p = pathlib.Path(sys.argv[1])
+ksu_dir = pathlib.Path("drivers/kernelsu")
+
+manual_syms = set(["KSU_MANUAL_HOOK", "KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
+disable_syms = set([
+    "KSU_WITH_KPROBES",
+    "KSU_TRACEPOINT_HOOK",
+    "KSU_SUSFS",
+    "KSU_LKM",
+    "KSU_MANUAL_HOOK_AUTO_INITRC_HOOK",
+    "KSU_MANUAL_HOOK_AUTO_INPUT_HOOK",
+])
+if ksu_dir.exists():
+    for kc_file in ksu_dir.rglob("Kconfig*"):
+        ktxt = kc_file.read_text(errors="ignore")
+        for m in re.finditer(r'^\s*config\s+([A-Z0-9_]+)', ktxt, re.M):
+            sym = m.group(1)
+            if sym in disable_syms or sym in manual_syms:
+                continue
+            if "MANUAL" in sym and "HOOK" in sym and "AUTO" not in sym:
+                manual_syms.add(sym)
+            elif any(x in sym for x in ("KPROBE", "TRACEPOINT", "SUSFS", "LKM")):
+                disable_syms.add(sym)
+
+dtxt = defcfg_p.read_text()
+for sym in manual_syms | disable_syms:
+    dtxt = re.sub(rf'^.*CONFIG_{sym}\b.*$\n?', '', dtxt, flags=re.M)
+for sym in sorted(disable_syms):
+    dtxt += f"\n# CONFIG_{sym} is not set"
+for sym in sorted(manual_syms):
+    dtxt += f"\nCONFIG_{sym}=y"
+defcfg_p.write_text(dtxt + "\n")
+print("[OK] Kconfig Manual Hook aktif:", ", ".join(sorted(manual_syms)))
+EOF
+
+sed -i '/CONFIG_LOCALVERSION=/d;/CONFIG_LOCALVERSION_AUTO/d' "$DEFCONFIG_PATH"
+echo 'CONFIG_LOCALVERSION="-XtrSolRadical"' >> "$DEFCONFIG_PATH"
+echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEFCONFIG_PATH"
+
+for cfg in \
+    CONFIG_NOMOUNT=y \
+    CONFIG_KSU=y \
+    CONFIG_KALLSYMS=y \
+    CONFIG_KALLSYMS_ALL=y \
+    CONFIG_OVERLAY_FS=y; do
+    grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
+done
+
+# 5. Siapkan variabel toolchain & generate out/.config lebih dulu agar semua simbol Kconfig terbaca
+export PATH="$CLANG_DIR:$PATH"
+export ARCH=arm64
+export SUBARCH=arm64
+export KBUILD_BUILD_USER="XtRs"
+export KBUILD_BUILD_HOST="Lavender"
+
+MAKE_ARGS=(
+    O=out
+    ARCH=arm64
+    CC=clang
+    CLANG_TRIPLE=aarch64-linux-gnu-
+    CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    KCFLAGS="-Wno-error"
+)
+
+make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+# 6. Konversi Kbuild BakaSU (baca out/.config untuk KSU_PREINIT dll), shim header, & tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
-    DEFCONFIG_FILE="$DEFCONFIG_PATH" python3 - << 'EOF'
+    python3 - << 'EOF'
 import os, pathlib, re, subprocess
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
+
+# Baca seluruh simbol aktif dari out/.config
+enabled_configs = set(["CONFIG_KSU", "CONFIG_ARM64", "CONFIG_KSU_MANUAL_HOOK", "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
+dot_cfg = pathlib.Path("out/.config")
+if dot_cfg.exists():
+    for line in dot_cfg.read_text(errors="ignore").splitlines():
+        m_cfg = re.match(r'^(CONFIG_[A-Z0-9_]+)=y$', line.strip())
+        if m_cfg:
+            enabled_configs.add(m_cfg.group(1))
+for dis in ("CONFIG_KSU_WITH_KPROBES", "CONFIG_KSU_TRACEPOINT_HOOK", "CONFIG_KSU_SUSFS",
+            "CONFIG_KSU_LKM", "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK", "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK"):
+    enabled_configs.discard(dis)
 
 # Pindai seluruh header include/linux/*.h untuk mencegah redefinition
 existing_funcs = set()
@@ -138,38 +227,6 @@ global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
 
-# Konfigurasi Kconfig BakaSU: Manual Hook aktif + Auto Setuid via LSM, tanpa auto initrc/input
-manual_syms = set(["KSU_MANUAL_HOOK", "KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
-disable_syms = set([
-    "KSU_WITH_KPROBES",
-    "KSU_TRACEPOINT_HOOK",
-    "KSU_SUSFS",
-    "KSU_LKM",
-    "KSU_MANUAL_HOOK_AUTO_INITRC_HOOK",
-    "KSU_MANUAL_HOOK_AUTO_INPUT_HOOK",
-])
-for kc_file in ksu_dir.rglob("Kconfig*"):
-    ktxt = kc_file.read_text(errors="ignore")
-    for m in re.finditer(r'^\s*config\s+([A-Z0-9_]+)', ktxt, re.M):
-        sym = m.group(1)
-        if sym in disable_syms or sym in manual_syms:
-            continue
-        if "MANUAL" in sym and "HOOK" in sym and "AUTO" not in sym:
-            manual_syms.add(sym)
-        elif any(x in sym for x in ("KPROBE", "TRACEPOINT", "SUSFS", "LKM")):
-            disable_syms.add(sym)
-
-defcfg_p = pathlib.Path(os.environ["DEFCONFIG_FILE"])
-dtxt = defcfg_p.read_text()
-for sym in manual_syms | disable_syms:
-    dtxt = re.sub(rf'^.*CONFIG_{sym}\b.*$\n?', '', dtxt, flags=re.M)
-for sym in sorted(disable_syms):
-    dtxt += f"\n# CONFIG_{sym} is not set"
-for sym in sorted(manual_syms):
-    dtxt += f"\nCONFIG_{sym}=y"
-defcfg_p.write_text(dtxt + "\n")
-print("[OK] Kconfig Manual Hook aktif:", ", ".join(sorted(manual_syms)))
-
 # Baca Kbuild BakaSU sebelum dikonversi ke Makefile 4.4
 raw = ""
 if kbuild_f.exists():
@@ -253,7 +310,7 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     sys_h.write_text("\n".join(lines) + "\n")
     print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
 
-# Susun daftar objek .o KHUSUS arsitektur arm64
+# Evaluasi blok kondisional Kbuild terhadap out/.config (termasuk CONFIG_KSU_PREINIT)
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -263,14 +320,18 @@ for line in raw.splitlines():
     if s.startswith(("ifeq ", "ifneq ", "ifdef ", "ifndef ")):
         low = s.lower()
         is_neg = s.startswith(("ifneq ", "ifndef "))
+        if re.search(r',\s*\)', s):
+            is_neg = not is_neg
+        cond_cfgs = re.findall(r'CONFIG_[A-Z0-9_]+', s)
         if any(k in low for k in ("susfs", "lkm", "tracepoint", "kprobes", "syscall_hook", "inline_hook")):
             skip_stack.append(not is_neg)
-        elif "manual" in low and "hook" in low:
-            skip_stack.append(is_neg)
         elif any(k in low for k in ("config_arm64", "aarch64")):
             skip_stack.append(is_neg)
         elif any(k in low for k in ("config_arm", "config_x86", "config_riscv", "arm32", "x86_64", "riscv")):
             skip_stack.append(not is_neg)
+        elif cond_cfgs:
+            is_set = all(c in enabled_configs for c in cond_cfgs)
+            skip_stack.append((not is_set) if not is_neg else is_set)
         else:
             skip_stack.append(False)
         continue
@@ -285,28 +346,46 @@ for line in raw.splitlines():
     if not any(skip_stack):
         active_lines.append(s)
 
+# Kumpulkan seluruh .o dari kernelsu-objs, kernelsu-y, kernelsu-$(CONFIG_*), dan obj-$(CONFIG_*)
 objs = []
 for s in active_lines:
-    if re.match(r'^(kernelsu-objs|kernelsu-y|obj-\$\(CONFIG_KSU\))\s*[:+]?=', s):
-        part = s.split("=", 1)[1]
-        for tok in part.split():
-            tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
-            if not tok.endswith(".o") or tok == "kernelsu.o":
-                continue
-            if any(arch in tok.lower() for arch in ("x86", "arm32", "riscv", "hook/arm/")):
-                continue
+    m_lhs = re.match(
+        r'^(kernelsu-objs|kernelsu-y|kernelsu-\$\((CONFIG_[A-Z0-9_]+)\)|obj-\$\((CONFIG_[A-Z0-9_]+)\))\s*[:+]?=\s*(.+)$',
+        s
+    )
+    if not m_lhs:
+        continue
+    cfg_cond = m_lhs.group(2) or m_lhs.group(3)
+    if cfg_cond and cfg_cond not in enabled_configs:
+        continue
+    for tok in m_lhs.group(4).split():
+        tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
+        if tok == "kernelsu.o":
+            continue
+        if any(arch in tok.lower() for arch in ("x86", "arm32", "riscv", "hook/arm/")):
+            continue
+        if tok.endswith(".o"):
             if tok not in objs:
                 objs.append(tok)
+        elif tok.endswith("/"):
+            sub = ksu_dir / tok.rstrip("/")
+            if sub.is_dir():
+                for p in sorted(sub.rglob("*.c")):
+                    rel = p.relative_to(ksu_dir).as_posix()
+                    o_rel = rel[:-2] + ".o"
+                    if o_rel not in objs:
+                        objs.append(o_rel)
 
-if not objs:
-    for p in sorted(ksu_dir.rglob("*.c")):
+# Pastikan preinit ikut masuk jika CONFIG_KSU_PREINIT aktif di .config
+if "CONFIG_KSU_PREINIT" in enabled_configs:
+    for p in sorted(ksu_dir.rglob("*preinit*.c")):
         rel = p.relative_to(ksu_dir).as_posix()
-        if any(x in rel.lower() for x in ("test", "example", "susfs", "lkm", "tracepoint", "kprobes", "x86", "arm32", "riscv", "hook/arm/")):
-            continue
-        objs.append(rel[:-2] + ".o")
+        o_rel = rel[:-2] + ".o"
+        if o_rel not in objs:
+            objs.append(o_rel)
 
 obj_list = " \\\n\t".join(objs)
-manual_defs = " ".join(f"-DCONFIG_{s}=1" for s in sorted(manual_syms))
+active_defs = " ".join(f"-D{c}=1" for c in sorted(enabled_configs) if c.startswith("CONFIG_KSU"))
 mk = f"""# Kbuild 4.4 Makefile for BakaSU (arm64 only)
 obj-$(CONFIG_KSU) += kernelsu.o
 kernelsu-objs := {obj_list}
@@ -334,7 +413,7 @@ ccflags-y += -I$(srctree)/security/selinux
 ccflags-y += -I$(srctree)/security/selinux/include
 ccflags-y += -I$(objtree)/security/selinux
 ccflags-y += -I$(objtree)/security/selinux/include
-ccflags-y += {manual_defs} -DKSU_MANUAL_HOOK=1
+ccflags-y += {active_defs}
 ccflags-y += -DKSU_GIT_VERSION=14762 -DKSU_VERSION=14762 -DKSU_VERSION_FULL=\\"v3.0.0-bakasu\\"
 ccflags-y += -DEXPECTED_SIZE=0x033b -DEXPECTED_HASH=\\"0000000000000000000000000000000000000000000000000000000000000000\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
@@ -448,7 +527,7 @@ if kc_path.exists():
 EOF
 fi
 
-# 3. Terapkan Manual Hooks BakaSU secara aman (cek simbol yang tersedia di drivers/kernelsu)
+# 7. Terapkan Manual Hooks BakaSU secara aman (cek simbol yang tersedia di drivers/kernelsu)
 echo "[INFO] Memasang manual hooks pada fs/ dan drivers/input/..."
 python3 - << 'EOF'
 import pathlib, re
@@ -609,13 +688,7 @@ if inp_p.exists() and has_sym("ksu_handle_input_handle_event"):
         print("[OK] Patched drivers/input/input.c")
 EOF
 
-# 4. Integrasi NoMount (branch dev)
-if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ fs/ drivers/ 2>/dev/null; then
-    echo "[INFO] Memasang NoMount (branch dev)..."
-    curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
-fi
-
-# 5. Patch kompatibilitas VFS Linux 4.4 untuk fs/nomount
+# 8. Patch kompatibilitas VFS Linux 4.4 untuk fs/nomount
 if [ -d "fs/nomount" ]; then
     echo "[INFO] Menerapkan patch kompatibilitas Linux 4.4 pada fs/nomount..."
     python3 - << 'EOF'
@@ -752,52 +825,20 @@ print("[INFO] Patch Linux 4.4 pada fs/nomount selesai.")
 EOF
 fi
 
-# 6. Aktifkan konfigurasi BakaSU Manual Hook + NoMount + Nama Kernel XtrSolRadical
-sed -i '/CONFIG_LOCALVERSION=/d;/CONFIG_LOCALVERSION_AUTO/d' "$DEFCONFIG_PATH"
-echo 'CONFIG_LOCALVERSION="-XtrSolRadical"' >> "$DEFCONFIG_PATH"
-echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEFCONFIG_PATH"
-
-for cfg in \
-    CONFIG_NOMOUNT=y \
-    CONFIG_KSU=y \
-    CONFIG_KALLSYMS=y \
-    CONFIG_KALLSYMS_ALL=y \
-    CONFIG_OVERLAY_FS=y; do
-    grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
-done
-
-# 7. Siapkan variabel build tunggal & generate header (compile.h + flask.h) sebelum cek KSU
-export PATH="$CLANG_DIR:$PATH"
-export ARCH=arm64
-export SUBARCH=arm64
-export KBUILD_BUILD_USER="XtRs"
-export KBUILD_BUILD_HOST="Lavender"
-
-MAKE_ARGS=(
-    O=out
-    ARCH=arm64
-    CC=clang
-    CLANG_TRIPLE=aarch64-linux-gnu-
-    CROSS_COMPILE=aarch64-linux-gnu-
-    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-    KCFLAGS="-Wno-error"
-)
-
-make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+# 9. Generate header prasyarat (compile.h + flask.h) & compile penuh hingga Image.gz-dtb
 make "${MAKE_ARGS[@]}" prepare
 make -j"$(nproc --all)" "${MAKE_ARGS[@]}" init/ security/selinux/
 
 if ! make -k -j"$(nproc --all)" "${MAKE_ARGS[@]}" drivers/kernelsu/ 2>&1 | tee /tmp/ksu_check.log; then
     echo "================ ALL REMAINING BAKASU ERRORS ================"
-    grep -n -C 2 -E ":\s*(fatal )?error:" /tmp/ksu_check.log || true
+    grep -n -C 2 -E ":\s*(fatal )?error:|undefined reference to" /tmp/ksu_check.log || true
     echo "============================================================="
     exit 1
 fi
 
-# 8. Lanjutkan full build kernel 4.4 sdm660 hingga selesai
 if ! make -j"$(nproc --all)" "${MAKE_ARGS[@]}" 2>&1 | tee /tmp/build.log; then
-    echo "================ EXACT COMPILER ERRORS ================"
-    grep -n -C 4 -E ":\s*(fatal )?error:" /tmp/build.log | tail -n 50 || true
-    echo "======================================================="
+    echo "================ EXACT COMPILER/LINKER ERRORS ================"
+    grep -n -C 3 -E ":\s*(fatal )?error:|undefined reference to" /tmp/build.log | tail -n 50 || true
+    echo "=============================================================="
     exit 1
 fi
