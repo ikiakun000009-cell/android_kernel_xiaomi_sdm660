@@ -38,9 +38,9 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU (khusus arm64), generate syscall_no.h, & shim header 4.4
+# 2b. Konversi Kbuild BakaSU (arm64), shim header, & tambalan LSM/VFS Linux 4.4.302
 if [ -d "drivers/kernelsu" ]; then
-    echo "[INFO] Menyesuaikan Kbuild, header generator, dan kompatibilitas 4.4.302 pada BakaSU..."
+    echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     DEFCONFIG_FILE="$DEFCONFIG_PATH" python3 - << 'EOF'
 import os, pathlib, re, subprocess
 
@@ -48,16 +48,31 @@ ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
 
-# Buat shim header linux/pgtable.h untuk kernel 4.4
-pgtable_shim = ksu_dir / "include" / "linux" / "pgtable.h"
-pgtable_shim.parent.mkdir(parents=True, exist_ok=True)
-pgtable_shim.write_text(
-    "#ifndef _KSU_COMPAT_LINUX_PGTABLE_H\n"
-    "#define _KSU_COMPAT_LINUX_PGTABLE_H\n"
-    "#include <linux/mm.h>\n"
-    "#include <asm/pgtable.h>\n"
-    "#endif\n"
-)
+# Buat shim header untuk header <linux/...> yang belum ada di kernel 4.4
+shims = {
+    "linux/pgtable.h": "#include <linux/mm.h>\n#include <asm/pgtable.h>\n",
+    "linux/set_memory.h": "#include <asm/cacheflush.h>\n",
+    "linux/sched/signal.h": "#include <linux/sched.h>\n",
+    "linux/sched/task.h": "#include <linux/sched.h>\n",
+    "linux/sched/mm.h": "#include <linux/sched.h>\n#include <linux/mm.h>\n",
+    "linux/sched/user.h": "#include <linux/sched.h>\n",
+    "linux/minmax.h": "#include <linux/kernel.h>\n",
+    "linux/bits.h": "#include <linux/bitops.h>\n",
+    "linux/build_bug.h": "#include <linux/bug.h>\n",
+    "linux/stdarg.h": "#include <stdarg.h>\n",
+    "linux/overflow.h": (
+        "#include <linux/kernel.h>\n"
+        "#ifndef struct_size\n"
+        "#define struct_size(p, member, count) (sizeof(*(p)) + sizeof(*(p)->member) * (count))\n"
+        "#endif\n"
+    ),
+}
+for rel_h, body in shims.items():
+    if not (pathlib.Path("include") / rel_h).exists():
+        dst = ksu_dir / "include" / rel_h
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        guard = "_KSU_SHIM_" + re.sub(r'[^A-Za-z0-9]', '_', rel_h).upper()
+        dst.write_text(f"#ifndef {guard}\n#define {guard}\n{body}#endif\n")
 
 # Deteksi otomatis simbol Kconfig untuk Manual Hook di BakaSU
 manual_syms = set(["KSU_MANUAL_HOOK"])
@@ -134,13 +149,11 @@ for m in re.finditer(r'^\s*([^\s:#]+\.h)\s*:\s*([^\n]+)', raw, re.M):
             cmd_str = expand_vars(cmds[cm.group(1)], tgt_path, deps_exp)
         else:
             cmd_str = expand_vars(r.lstrip("@- "), tgt_path, deps_exp)
-        print(f"[INFO] Menjalankan generator header: {cmd_str}")
         subprocess.run(cmd_str, shell=True, check=False)
 
 # Fallback jika compat/syscall_no.h belum terbuat atau kosong
 sys_h = ksu_dir / "compat" / "syscall_no.h"
 if not sys_h.exists() or sys_h.stat().st_size == 0:
-    print("[INFO] Membuat fallback drivers/kernelsu/compat/syscall_no.h...")
     u32_map = {}
     u32_p = pathlib.Path("arch/arm64/include/asm/unistd32.h")
     if u32_p.exists():
@@ -166,10 +179,8 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     sys_h.parent.mkdir(parents=True, exist_ok=True)
     sys_h.write_text("\n".join(lines) + "\n")
     print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
-else:
-    print(f"[OK] Header compat/syscall_no.h berhasil di-generate ({sys_h.stat().st_size} bytes)")
 
-# Susun daftar objek .o KHUSUS arsitektur arm64 (lewati x86_64, arm32, riscv64)
+# Susun daftar objek .o KHUSUS arsitektur arm64
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -258,6 +269,44 @@ subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
+
+# Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) bukan struct hlist_head (4.17+)
+lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
+for lsm_file in ksu_dir.rglob("*lsm_hook_magic*.c"):
+    ltxt = lsm_file.read_text(errors="ignore")
+    if "hlist_node" not in lsm_h:
+        ltxt = ltxt.replace("struct hlist_head", "struct list_head")
+        ltxt = ltxt.replace("struct hlist_node", "struct list_head")
+        ltxt = re.sub(
+            r'hook->list\.list\.next\s*=\s*head->first\s*;',
+            'list_add_tail_rcu(&hook->list.list, head);',
+            ltxt
+        )
+        ltxt = re.sub(
+            r'if\s*\(\s*head->first\s*\)\s*head->first->pprev\s*=\s*&hook->list\.list\.next\s*;',
+            '',
+            ltxt,
+            flags=re.DOTALL
+        )
+        ltxt = re.sub(r'hook->list\.list\.pprev\s*=\s*&head->first\s*;', '', ltxt)
+        ltxt = re.sub(
+            r'(?:rcu_assign_pointer|WRITE_ONCE)\s*\(\s*head->first\s*,\s*&hook->list\.list\s*\)\s*;',
+            '',
+            ltxt
+        )
+        ltxt = re.sub(
+            r'hlist_add_head_rcu\s*\(\s*&hook->list\.list\s*,\s*head\s*\)\s*;',
+            'list_add_tail_rcu(&hook->list.list, head);',
+            ltxt
+        )
+        ltxt = ltxt.replace("->head->first", "->head->next")
+        ltxt = ltxt.replace("head->first", "head->next")
+        ltxt = ltxt.replace("hlist_for_each_entry", "list_for_each_entry")
+        ltxt = ltxt.replace("hlist_del_rcu", "list_del_rcu")
+    if not re.search(r'\bchar\s*\*\s*lsm\b', lsm_h):
+        ltxt = re.sub(r'^(\s*hook->list\.lsm\s*=.*)$', r'// [4.4-compat] \1', ltxt, flags=re.M)
+    lsm_file.write_text(ltxt)
+    print("[OK] lsm_hook_magic.c disesuaikan dengan struct list_head Linux 4.4")
 
 # Pastikan variabel hook global tidak tertahan keyword 'static'
 for cfile in ksu_dir.rglob("*.c"):
