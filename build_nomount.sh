@@ -48,6 +48,18 @@ ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
 
+# Pindai seluruh header include/linux/*.h untuk mencegah redefinition
+existing_funcs = set()
+for hdr in pathlib.Path("include/linux").glob("*.h"):
+    try:
+        htxt = hdr.read_text(errors="ignore")
+        for m in re.finditer(r'\bstatic\s+(?:__always_)?inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\(', htxt):
+            existing_funcs.add(m.group(1))
+        for m in re.finditer(r'^\s*#\s*define\s+([a-zA-Z_]\w*)\s*\(', htxt, re.M):
+            existing_funcs.add(m.group(1))
+    except Exception:
+        pass
+
 # Buat shim header untuk header <linux/...> yang belum ada di kernel 4.4
 shims = {
     "linux/pgtable.h": "#include <linux/mm.h>\n#include <asm/pgtable.h>\n",
@@ -73,6 +85,56 @@ for rel_h, body in shims.items():
         dst.parent.mkdir(parents=True, exist_ok=True)
         guard = "_KSU_SHIM_" + re.sub(r'[^A-Za-z0-9]', '_', rel_h).upper()
         dst.write_text(f"#ifndef {guard}\n#define {guard}\n{body}#endif\n")
+
+# Buat ksu_44_shim.h untuk fungsi/tipe pasca-4.4 yang belum ada di kernel 4.4.302
+shim_lines = [
+    "#ifndef _KSU_44_GLOBAL_SHIM_H",
+    "#define _KSU_44_GLOBAL_SHIM_H",
+    "#include <linux/version.h>",
+    "#include <linux/types.h>",
+    "#include <linux/slab.h>",
+    "#include <linux/vmalloc.h>",
+    "#include <linux/string.h>",
+    "#include <linux/ktime.h>",
+    "#include <linux/compat.h>",
+    "#ifndef in_compat_syscall",
+    "#define in_compat_syscall() is_compat_task()",
+    "#endif",
+    "#ifndef struct_size",
+    "#define struct_size(p, member, count) (sizeof(*(p)) + sizeof(*(p)->member) * (count))",
+    "#endif",
+    "#ifndef array_size",
+    "#define array_size(a, b) ((a) * (b))",
+    "#endif",
+]
+if "strscpy" not in existing_funcs:
+    shim_lines.append("#define strscpy(dst, src, size) strlcpy((dst), (src), (size))")
+if "kvmalloc" not in existing_funcs:
+    shim_lines.extend([
+        "static inline void *kvmalloc(size_t size, gfp_t flags)",
+        "{",
+        "    void *p = kmalloc(size, flags | __GFP_NOWARN);",
+        "    return p ? p : __vmalloc(size, flags, PAGE_KERNEL);",
+        "}",
+    ])
+if "kvzalloc" not in existing_funcs:
+    shim_lines.append("#define kvzalloc(size, flags) kvmalloc((size), (flags) | __GFP_ZERO)")
+if "ktime_get_boottime_ns" not in existing_funcs:
+    shim_lines.append("#define ktime_get_boottime_ns() ktime_to_ns(ktime_get_boottime())")
+if not pathlib.Path("include/linux/refcount.h").exists():
+    shim_lines.extend([
+        "#include <linux/atomic.h>",
+        "typedef struct { atomic_t refs; } refcount_t;",
+        "#define REFCOUNT_INIT(n) { .refs = ATOMIC_INIT(n) }",
+        "static inline void refcount_set(refcount_t *r, int n) { atomic_set(&r->refs, n); }",
+        "static inline unsigned int refcount_read(const refcount_t *r) { return atomic_read(&r->refs); }",
+        "static inline void refcount_inc(refcount_t *r) { atomic_inc(&r->refs); }",
+        "static inline bool refcount_dec_and_test(refcount_t *r) { return atomic_dec_and_test(&r->refs); }",
+    ])
+shim_lines.append("#endif")
+global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
+global_shim.parent.mkdir(parents=True, exist_ok=True)
+global_shim.write_text("\n".join(shim_lines) + "\n")
 
 # Deteksi otomatis simbol Kconfig untuk Manual Hook di BakaSU
 manual_syms = set(["KSU_MANUAL_HOOK"])
@@ -238,6 +300,7 @@ mk = f"""# Kbuild 4.4 Makefile for BakaSU (arm64 only)
 obj-$(CONFIG_KSU) += kernelsu.o
 kernelsu-objs := {obj_list}
 
+ccflags-y += -include $(srctree)/drivers/kernelsu/compat/ksu_44_shim.h
 ccflags-y += -I$(srctree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/drivers/kernelsu/include
 ccflags-y += -I$(srctree)/drivers/kernelsu/compat
@@ -270,28 +333,36 @@ subdir-ccflags-y += $(ccflags-y)
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
-# Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) bukan struct hlist_head (4.17+)
+# Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
 lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
+m_shl = re.search(r'struct\s+security_hook_list\s*\{([^}]*)\}', lsm_h, re.S)
+has_lsm_member = bool(m_shl and re.search(r'\blsm\b', m_shl.group(1)))
+
 for lsm_file in ksu_dir.rglob("*lsm_hook_magic*.c"):
     ltxt = lsm_file.read_text(errors="ignore")
     if "hlist_node" not in lsm_h:
         ltxt = ltxt.replace("struct hlist_head", "struct list_head")
         ltxt = ltxt.replace("struct hlist_node", "struct list_head")
         ltxt = re.sub(
-            r'hook->list\.list\.next\s*=\s*head->first\s*;',
+            r'\bif\s*\([^)]*\)\s*(?:\{[^}]*\bpprev\b[^}]*\}|[^;]*\bpprev\b[^;]*;)',
+            '',
+            ltxt
+        )
+        ltxt = re.sub(r'^[^\n]*\bpprev\b[^\n]*$', r'/* [4.4] pprev removed */', ltxt, flags=re.M)
+        ltxt = re.sub(
+            r'^[^\n]*hook->list\.list\.next\s*=\s*head->first\s*;[^\n]*$',
+            r'/* [4.4] handled by list_add_tail_rcu */',
+            ltxt,
+            flags=re.M
+        )
+        ltxt = re.sub(
+            r'(?:rcu_assign_pointer|WRITE_ONCE)\s*\(\s*head->first\s*,\s*&hook->list\.list\s*\)\s*;',
             'list_add_tail_rcu(&hook->list.list, head);',
             ltxt
         )
         ltxt = re.sub(
-            r'if\s*\(\s*head->first\s*\)\s*head->first->pprev\s*=\s*&hook->list\.list\.next\s*;',
-            '',
-            ltxt,
-            flags=re.DOTALL
-        )
-        ltxt = re.sub(r'hook->list\.list\.pprev\s*=\s*&head->first\s*;', '', ltxt)
-        ltxt = re.sub(
-            r'(?:rcu_assign_pointer|WRITE_ONCE)\s*\(\s*head->first\s*,\s*&hook->list\.list\s*\)\s*;',
-            '',
+            r'head->first\s*=\s*&hook->list\.list\s*;',
+            'list_add_tail_rcu(&hook->list.list, head);',
             ltxt
         )
         ltxt = re.sub(
@@ -299,14 +370,13 @@ for lsm_file in ksu_dir.rglob("*lsm_hook_magic*.c"):
             'list_add_tail_rcu(&hook->list.list, head);',
             ltxt
         )
-        ltxt = ltxt.replace("->head->first", "->head->next")
-        ltxt = ltxt.replace("head->first", "head->next")
+        ltxt = ltxt.replace("->first", "->next")
         ltxt = ltxt.replace("hlist_for_each_entry", "list_for_each_entry")
         ltxt = ltxt.replace("hlist_del_rcu", "list_del_rcu")
-    if not re.search(r'\bchar\s*\*\s*lsm\b', lsm_h):
-        ltxt = re.sub(r'^(\s*hook->list\.lsm\s*=.*)$', r'// [4.4-compat] \1', ltxt, flags=re.M)
+    if not has_lsm_member:
+        ltxt = re.sub(r'^[^\n]*->list\.lsm\s*=[^\n]*$', r'/* [4.4] security_hook_list has no lsm */', ltxt, flags=re.M)
     lsm_file.write_text(ltxt)
-    print("[OK] lsm_hook_magic.c disesuaikan dengan struct list_head Linux 4.4")
+    print("[OK] lsm_hook_magic.c disesuaikan dengan struct list_head Linux 4.4 (tanpa .lsm)")
 
 # Pastikan variabel hook global tidak tertahan keyword 'static'
 for cfile in ksu_dir.rglob("*.c"):
@@ -332,18 +402,7 @@ for fw_file in ksu_dir.rglob("*file_wrapper*.c"):
     fw_file.write_text(ftxt)
     print("[OK] file_wrapper.c disesuaikan dengan struct file_operations 4.4")
 
-# Pindai seluruh header include/linux/*.h untuk mencegah redefinition di kernel_compat.h
-existing_funcs = set()
-for hdr in pathlib.Path("include/linux").glob("*.h"):
-    try:
-        htxt = hdr.read_text(errors="ignore")
-        for m in re.finditer(r'\bstatic\s+(?:__always_)?inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\(', htxt):
-            existing_funcs.add(m.group(1))
-        for m in re.finditer(r'^\s*#\s*define\s+([a-zA-Z_]\w*)\s*\(', htxt, re.M):
-            existing_funcs.add(m.group(1))
-    except Exception:
-        pass
-
+# Hapus definisi fungsi duplikat di kernel_compat.h agar tidak bentrok dengan header kernel 4.4.302
 kc_path = ksu_dir / "compat" / "kernel_compat.h"
 if kc_path.exists():
     kc = kc_path.read_text()
