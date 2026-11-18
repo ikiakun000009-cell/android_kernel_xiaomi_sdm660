@@ -35,11 +35,11 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU menjadi Makefile murni Linux 4.4
+# 2b. Konversi Kbuild BakaSU menjadi Makefile murni Linux 4.4 + header SELinux
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Mengonversi Kbuild BakaSU ke Makefile Kbuild 4.4..."
     python3 - << 'EOF'
-import pathlib, re
+import pathlib
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
@@ -52,22 +52,22 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Ekstrak daftar file .o dari Kbuild bawaan BakaSU, fallback ke scan *.c jika kosong
 objs = []
 for line in raw.splitlines():
     s = line.strip()
-    if s.startswith("#") or "susfs" in s.lower() or "lkm" in s.lower():
+    if s.startswith("#") or any(x in s.lower() for x in ("susfs", "lkm", "tracepoint")):
         continue
     if "kernelsu-objs" in s or "kernelsu-y" in s:
         part = s.split("=", 1)[1] if "=" in s else ""
         for tok in part.replace("\\", " ").split():
+            tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
             if tok.endswith(".o") and tok not in objs:
                 objs.append(tok)
 
 if not objs:
     for p in sorted(ksu_dir.rglob("*.c")):
         rel = p.relative_to(ksu_dir).as_posix()
-        if not any(x in rel.lower() for x in ("test", "example", "susfs")):
+        if not any(x in rel.lower() for x in ("test", "example", "susfs", "lkm", "tracepoint")):
             objs.append(rel[:-2] + ".o")
 
 obj_list = " \\\n\t".join(objs)
@@ -77,17 +77,24 @@ kernelsu-objs := {obj_list}
 
 ccflags-y += -I$(srctree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/drivers/kernelsu/include
+ccflags-y += -I$(srctree)/drivers/kernelsu/compat
+ccflags-y += -I$(srctree)/drivers/kernelsu/core
+ccflags-y += -I$(srctree)/drivers/kernelsu/selinux
 ccflags-y += -I$(srctree)/KernelSU/kernel
 ccflags-y += -I$(srctree)/KernelSU/kernel/include
 ccflags-y += -I$(srctree)/KernelSU/uapi
-ccflags-y += -DKSU_GIT_VERSION=12000 -DKSU_VERSION=12000
+ccflags-y += -I$(srctree)/security/selinux
+ccflags-y += -I$(srctree)/security/selinux/include
+ccflags-y += -I$(objtree)/security/selinux
+ccflags-y += -I$(objtree)/security/selinux/include
+ccflags-y += -DKSU_GIT_VERSION=14762 -DKSU_VERSION=14762 -DKSU_VERSION_FULL=\\"v3.0.0-bakasu\\"
 ccflags-y += -DEXPECTED_SIZE=0x033b -DEXPECTED_HASH=\\"0000000000000000000000000000000000000000000000000000000000000000\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
+subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
-print("[OK] Kbuild dihapus, drivers/kernelsu/Makefile dibuat dengan objek:")
-print("    ", ", ".join(objs))
+print("[OK] Makefile BakaSU dibuat dengan header SELinux & objek:", ", ".join(objs))
 EOF
 fi
 
