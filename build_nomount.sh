@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -eo pipefail
 
 CLANG_DIR="$PWD/clang/bin"
 BAKASU_REPO="https://github.com/Baka-SU/BakaSU.git"
@@ -18,7 +18,7 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU (salin langsung tanpa symlink agar aman untuk O=out 4.4)
+# 2. Integrasi BakaSU (salin langsung + folder uapi agar aman untuk O=out 4.4)
 if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Mengkloning BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
     rm -rf KernelSU drivers/kernelsu
@@ -29,22 +29,49 @@ if [ ! -e "drivers/kernelsu" ]; then
     else
         cp -rf KernelSU drivers/kernelsu
     fi
-    [ -d "KernelSU/uapi" ] && [ ! -e "drivers/uapi" ] && cp -rf KernelSU/uapi drivers/uapi
+    if [ -d "KernelSU/uapi" ]; then
+        cp -rf KernelSU/uapi drivers/kernelsu/uapi
+        [ ! -e "drivers/uapi" ] && cp -rf KernelSU/uapi drivers/uapi
+    fi
 
     grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU (multi-line) menjadi Makefile Kbuild 4.4 + hapus duplikat backport
+# 2b. Konversi Kbuild BakaSU & tambal kompatibilitas API Linux 4.4.302
 if [ -d "drivers/kernelsu" ]; then
-    echo "[INFO] Menyesuaikan Makefile dan compat header BakaSU untuk kernel 4.4.302..."
-    python3 - << 'EOF'
-import pathlib, re
+    echo "[INFO] Menyesuaikan Kbuild dan kompatibilitas Linux 4.4.302 pada BakaSU..."
+    DEFCONFIG_FILE="$DEFCONFIG_PATH" python3 - << 'EOF'
+import os, pathlib, re
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
 
+# Deteksi otomatis simbol Kconfig untuk Manual Hook di BakaSU
+manual_syms = set(["KSU_MANUAL_HOOK"])
+disable_syms = set(["KSU_WITH_KPROBES", "KSU_TRACEPOINT_HOOK", "KSU_SUSFS", "KSU_LKM"])
+for kc_file in ksu_dir.rglob("Kconfig*"):
+    ktxt = kc_file.read_text(errors="ignore")
+    for m in re.finditer(r'^\s*config\s+([A-Z0-9_]+)', ktxt, re.M):
+        sym = m.group(1)
+        if "MANUAL" in sym and "HOOK" in sym:
+            manual_syms.add(sym)
+        elif any(x in sym for x in ("KPROBE", "TRACEPOINT", "SUSFS", "LKM")):
+            disable_syms.add(sym)
+
+defcfg_p = pathlib.Path(os.environ["DEFCONFIG_FILE"])
+dtxt = defcfg_p.read_text()
+for sym in manual_syms | disable_syms:
+    dtxt = re.sub(rf'^.*CONFIG_{sym}\b.*$\n?', '', dtxt, flags=re.M)
+for sym in sorted(disable_syms):
+    dtxt += f"\n# CONFIG_{sym} is not set"
+for sym in sorted(manual_syms):
+    dtxt += f"\nCONFIG_{sym}=y"
+defcfg_p.write_text(dtxt + "\n")
+print("[OK] Kconfig Manual Hook aktif:", ", ".join(sorted(manual_syms)))
+
+# Parse Kbuild BakaSU (gabungkan baris lanjutan '\')
 raw = ""
 if kbuild_f.exists():
     raw = kbuild_f.read_text()
@@ -52,9 +79,7 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Gabungkan baris lanjutan '\' agar semua file .o terbaca lengkap
 raw = re.sub(r'\\\r?\n', ' ', raw)
-
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -66,7 +91,7 @@ for line in raw.splitlines():
         if any(k in low for k in ("susfs", "lkm", "tracepoint", "kprobes")):
             is_neg = s.startswith(("ifneq ", "ifndef "))
             skip_stack.append(not is_neg)
-        elif "manual_hook" in low:
+        elif "manual" in low and "hook" in low:
             is_neg = s.startswith(("ifneq ", "ifndef "))
             skip_stack.append(is_neg)
         else:
@@ -80,10 +105,8 @@ for line in raw.splitlines():
         if skip_stack:
             skip_stack.pop()
         continue
-
-    if any(skip_stack):
-        continue
-    active_lines.append(s)
+    if not any(skip_stack):
+        active_lines.append(s)
 
 objs = []
 for s in active_lines:
@@ -101,6 +124,7 @@ if not objs:
             objs.append(rel[:-2] + ".o")
 
 obj_list = " \\\n\t".join(objs)
+manual_defs = " ".join(f"-DCONFIG_{s}=1" for s in sorted(manual_syms))
 mk = f"""# Kbuild 4.4 Makefile for BakaSU
 obj-$(CONFIG_KSU) += kernelsu.o
 kernelsu-objs := {obj_list}
@@ -109,8 +133,14 @@ ccflags-y += -I$(srctree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/drivers/kernelsu/include
 ccflags-y += -I$(srctree)/drivers/kernelsu/compat
 ccflags-y += -I$(srctree)/drivers/kernelsu/core
+ccflags-y += -I$(srctree)/drivers/kernelsu/hook
+ccflags-y += -I$(srctree)/drivers/kernelsu/infra
+ccflags-y += -I$(srctree)/drivers/kernelsu/manager
+ccflags-y += -I$(srctree)/drivers/kernelsu/policy
 ccflags-y += -I$(srctree)/drivers/kernelsu/runtime
 ccflags-y += -I$(srctree)/drivers/kernelsu/selinux
+ccflags-y += -I$(srctree)/drivers/kernelsu/supercall
+ccflags-y += -I$(srctree)/drivers/kernelsu/uapi
 ccflags-y += -I$(srctree)/KernelSU/kernel
 ccflags-y += -I$(srctree)/KernelSU/kernel/include
 ccflags-y += -I$(srctree)/KernelSU/uapi
@@ -118,6 +148,7 @@ ccflags-y += -I$(srctree)/security/selinux
 ccflags-y += -I$(srctree)/security/selinux/include
 ccflags-y += -I$(objtree)/security/selinux
 ccflags-y += -I$(objtree)/security/selinux/include
+ccflags-y += {manual_defs} -DKSU_MANUAL_HOOK=1
 ccflags-y += -DKSU_GIT_VERSION=14762 -DKSU_VERSION=14762 -DKSU_VERSION_FULL=\\"v3.0.0-bakasu\\"
 ccflags-y += -DEXPECTED_SIZE=0x033b -DEXPECTED_HASH=\\"0000000000000000000000000000000000000000000000000000000000000000\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
@@ -125,7 +156,7 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-v
 subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
-print(f"[OK] Makefile BakaSU dibuat ({len(objs)} objek):", ", ".join(objs))
+print(f"[OK] Makefile Kbuild 4.4 dibuat ({len(objs)} objek)")
 
 # Pastikan variabel hook global tidak tertahan keyword 'static'
 for cfile in ksu_dir.rglob("*.c"):
@@ -138,7 +169,20 @@ for cfile in ksu_dir.rglob("*.c"):
     if new_ctxt != ctxt:
         cfile.write_text(new_ctxt)
 
-# Pindai header include/linux/*.h untuk mencegah redefinition (seperti inode_lock/inode_unlock)
+# Sesuaikan struct file_operations di file_wrapper.c dengan include/linux/fs.h kernel 4.4
+fs_h = pathlib.Path("include/linux/fs.h").read_text(errors="ignore")
+for fw_file in ksu_dir.rglob("*file_wrapper*.c"):
+    ftxt = fw_file.read_text(errors="ignore")
+    if "iterate_shared" not in fs_h:
+        ftxt = ftxt.replace(".iterate_shared", ".iterate")
+    for member in ("copy_file_range", "clone_file_range", "dedupe_file_range",
+                   "remap_file_range", "fadvise", "uring_cmd", "uring_cmd_iopoll"):
+        if member not in fs_h:
+            ftxt = re.sub(rf'^(\s*\.{member}\s*=.*)$', r'// [4.4-compat] \1', ftxt, flags=re.M)
+    fw_file.write_text(ftxt)
+    print("[OK] file_wrapper.c disesuaikan dengan struct file_operations 4.4")
+
+# Pindai seluruh header include/linux/*.h untuk mencegah redefinition di kernel_compat.h
 existing_funcs = set()
 for hdr in pathlib.Path("include/linux").glob("*.h"):
     try:
@@ -435,11 +479,6 @@ EOF
 fi
 
 # 6. Aktifkan konfigurasi BakaSU Manual Hook + NoMount + Nama Kernel XtrSolRadical
-sed -i '/CONFIG_KSU_WITH_KPROBES/d;/CONFIG_KSU_TRACEPOINT_HOOK/d;/CONFIG_KSU_SUSFS/d' "$DEFCONFIG_PATH"
-echo "# CONFIG_KSU_WITH_KPROBES is not set" >> "$DEFCONFIG_PATH"
-echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set" >> "$DEFCONFIG_PATH"
-echo "# CONFIG_KSU_SUSFS is not set" >> "$DEFCONFIG_PATH"
-
 sed -i '/CONFIG_LOCALVERSION=/d;/CONFIG_LOCALVERSION_AUTO/d' "$DEFCONFIG_PATH"
 echo 'CONFIG_LOCALVERSION="-XtrSolRadical"' >> "$DEFCONFIG_PATH"
 echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEFCONFIG_PATH"
@@ -447,14 +486,13 @@ echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEFCONFIG_PATH"
 for cfg in \
     CONFIG_NOMOUNT=y \
     CONFIG_KSU=y \
-    CONFIG_KSU_MANUAL_HOOK=y \
     CONFIG_KALLSYMS=y \
     CONFIG_KALLSYMS_ALL=y \
     CONFIG_OVERLAY_FS=y; do
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 7. Compile kernel 4.4 sdm660
+# 7. Compile kernel 4.4 sdm660 (tangkap baris error murni jika gagal)
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
@@ -463,10 +501,15 @@ export KBUILD_BUILD_HOST="Lavender"
 
 make O=out ARCH=arm64 "$DEFCONFIG"
 
-make -j"$(nproc --all)" O=out \
+if ! make -j"$(nproc --all)" O=out \
     ARCH=arm64 \
     CC=clang \
     CLANG_TRIPLE=aarch64-linux-gnu- \
     CROSS_COMPILE=aarch64-linux-gnu- \
     CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-    KCFLAGS="-Wno-error"
+    KCFLAGS="-Wno-error" 2>&1 | tee /tmp/build.log; then
+    echo "================ EXACT COMPILER ERRORS ================"
+    grep -n -C 4 -E ":\s*(fatal )?error:" /tmp/build.log | tail -n 50 || true
+    echo "======================================================="
+    exit 1
+fi
