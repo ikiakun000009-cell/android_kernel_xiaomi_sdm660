@@ -65,7 +65,7 @@ if [ -d "fs/nomount" ]; then
     python3 - << 'EOF'
 import re, pathlib
 
-def strip_first_arg(code, func_name):
+def parse_call_args(code, func_name):
     out = []
     i = 0
     n = len(code)
@@ -75,24 +75,32 @@ def strip_first_arg(code, func_name):
         if not m:
             out.append(code[i:])
             break
-        out.append(code[i:m.end()])
+        out.append(code[i:m.start()])
         start = m.end()
         depth = 1
         j = start
-        first_comma = -1
+        args = []
+        arg_start = start
         while j < n and depth > 0:
             ch = code[j]
             if ch == '(':
                 depth += 1
             elif ch == ')':
                 depth -= 1
-            elif ch == ',' and depth == 1 and first_comma == -1:
-                first_comma = j
+                if depth == 0:
+                    args.append(code[arg_start:j].strip())
+            elif ch == ',' and depth == 1:
+                args.append(code[arg_start:j].strip())
+                arg_start = j + 1
             j += 1
-        if first_comma != -1:
-            out.append(code[first_comma + 1:j].lstrip())
+        yield_args = args
+        if func_name == "full_name_hash" and len(yield_args) == 3:
+            out.append(f"full_name_hash({yield_args[1]}, {yield_args[2]})")
+        elif func_name == "__vfs_getxattr" and len(yield_args) >= 5:
+            size_arg = re.sub(r'\bFLAGS_VAL\b', '', yield_args[4]).strip()
+            out.append(f"vfs_getxattr({yield_args[0]}, {yield_args[2]}, {yield_args[3]}, {size_arg})")
         else:
-            out.append(code[start:j])
+            out.append(code[m.start():j])
         i = j
     return ''.join(out)
 
@@ -104,7 +112,7 @@ if h_path.exists():
         h = "#include <linux/compat.h>\n" + h
     h = h.replace("in_compat_syscall()", "is_compat_task()")
     h = h.replace("iterate_shared", "iterate")
-    h = strip_first_arg(h, "full_name_hash")
+    h = parse_call_args(h, "full_name_hash")
     lookup_fn = (
         "static inline struct dentry *nm_lookup_one_len_unlocked(const char *name, struct dentry *base, int len)\n"
         "{\n"
@@ -123,15 +131,17 @@ c_path = pathlib.Path("fs/nomount/nomount.c")
 if c_path.exists():
     c = c_path.read_text()
     c = c.replace("iterate_shared", "iterate")
-    c = strip_first_arg(c, "full_name_hash")
+    c = parse_call_args(c, "full_name_hash")
+    c = parse_call_args(c, "__vfs_getxattr")
 
     # 4.4 rename() hanya menerima 4 argumen (tanpa flags)
     c = re.sub(
-        r'(static\s+int\s+nm_rename\s*\([^)]*?),\s*unsigned\s+int\s+flags\s*\)\s*\{',
+        r'(static\s+int\s+nm_\w*rename\s*\([^)]*?),\s*unsigned\s+int\s+flags\s*\)\s*\{',
         r'\1)\n{\n    unsigned int flags = 0;',
-        c
+        c,
+        flags=re.DOTALL
     )
-    c = re.sub(r'(->rename\s*\([^;]*?),\s*flags\s*\)', r'\1)', c)
+    c = re.sub(r'(->rename\s*\([^;]*?),\s*flags\s*\)', r'\1)', c, flags=re.DOTALL)
 
     # 4.4 memakai follow_link(dentry, cookie) bukan get_link(dentry, inode, done)
     c = re.sub(
@@ -144,12 +154,7 @@ if c_path.exists():
     c = c.replace(".get_link = nm_get_link", ".follow_link = nm_follow_link")
     c = c.replace(".get_link = nm_follow_link", ".follow_link = nm_follow_link")
 
-    # 4.4 xattr menggunakan vfs_getxattr(dentry, name, buf, size) dan handler tanpa inode
-    c = re.sub(
-        r'__vfs_getxattr\s*\(\s*([^,]+),\s*d_inode\([^)]+\)\s*,\s*([^,]+),\s*([^,]+),\s*([^,\)]+)[^\)]*\)',
-        r'vfs_getxattr(\1, \2, \3, \4)',
-        c
-    )
+    # 4.4 xattr handler tanpa parameter inode
     c = re.sub(
         r'(static\s+int\s+nm_xattr_get\s*\(\s*const\s+struct\s+xattr_handler\s*\*\s*\w+\s*,\s*struct\s+dentry\s*\*\s*dentry\s*,)\s*struct\s+inode\s*\*\s*inode\s*,',
         r'\1',
