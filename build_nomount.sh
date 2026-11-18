@@ -17,30 +17,37 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU_NMS
-if [ ! -d "KernelSU" ] && [ ! -d "drivers/kernelsu" ]; then
+# 2. Integrasi BakaSU_NMS (deteksi otomatis letak folder Kconfig)
+if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Memasang BakaSU_NMS dari $BAKASU_REPO..."
     BAKASU_BRANCH=$(git ls-remote --symref "$BAKASU_REPO" HEAD | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2}')
-    [ -z "$BAKASU_BRANCH" ] && BAKASU_BRANCH="main"
+    [ -z "$BAKASU_BRANCH" ] && BAKASU_BRANCH="NoMount"
     echo "[INFO] Branch BakaSU terdeteksi: $BAKASU_BRANCH"
 
-    RAW_SETUP="https://raw.githubusercontent.com/Bouteillepleine/OnePlus-BakaSu_NMS/$BAKASU_BRANCH/kernel/setup.sh"
-    if curl -fsSL "$RAW_SETUP" -o /tmp/bakasu_setup.sh; then
-        bash /tmp/bakasu_setup.sh "$BAKASU_BRANCH"
-        if [ -d "KernelSU/.git" ] && ! git -C KernelSU remote -v | grep -qi "Bouteillepleine/OnePlus-BakaSu_NMS"; then
-            rm -rf KernelSU
-            git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
-        fi
+    rm -rf KernelSU
+    git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
+
+    if [ -f "KernelSU/kernel/Kconfig" ]; then
+        ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
+    elif [ -f "KernelSU/Kconfig" ]; then
+        ln -sfn "$(pwd)/KernelSU" drivers/kernelsu
     else
-        git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
-        ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
-        grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-        grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+        KSU_KCONFIG=$(find KernelSU -maxdepth 3 -name "Kconfig" | head -n 1)
+        if [ -n "$KSU_KCONFIG" ]; then
+            ln -sfn "$(pwd)/$(dirname "$KSU_KCONFIG")" drivers/kernelsu
+        else
+            echo "[ERROR] File Kconfig tidak ditemukan di dalam repo BakaSU!"
+            ls -la KernelSU
+            exit 1
+        fi
     fi
+
+    grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+    grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
 # 3. Integrasi NoMount (hanya dipasang jika belum ada di dalam BakaSU_NMS)
-if [ ! -d "fs/nomount" ] && ! grep -rq "CONFIG_NOMOUNT" fs/ drivers/ 2>/dev/null; then
+if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ fs/ drivers/ 2>/dev/null; then
     echo "[INFO] Memasang NoMount (branch dev)..."
     curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
 else
@@ -60,7 +67,7 @@ for cfg in \
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 5. Compile kernel 4.4 sdm660
+# 5. Compile kernel 4.4 sdm660 (Clang + GNU Linker + bypass warning C lama)
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
