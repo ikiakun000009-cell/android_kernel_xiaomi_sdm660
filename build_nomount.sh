@@ -38,7 +38,7 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU, generate compat/syscall_no.h, & tambal API Linux 4.4.302
+# 2b. Konversi Kbuild BakaSU (khusus arm64), generate syscall_no.h, & shim header 4.4
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan Kbuild, header generator, dan kompatibilitas 4.4.302 pada BakaSU..."
     DEFCONFIG_FILE="$DEFCONFIG_PATH" python3 - << 'EOF'
@@ -47,6 +47,17 @@ import os, pathlib, re, subprocess
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
+
+# Buat shim header linux/pgtable.h untuk kernel 4.4
+pgtable_shim = ksu_dir / "include" / "linux" / "pgtable.h"
+pgtable_shim.parent.mkdir(parents=True, exist_ok=True)
+pgtable_shim.write_text(
+    "#ifndef _KSU_COMPAT_LINUX_PGTABLE_H\n"
+    "#define _KSU_COMPAT_LINUX_PGTABLE_H\n"
+    "#include <linux/mm.h>\n"
+    "#include <asm/pgtable.h>\n"
+    "#endif\n"
+)
 
 # Deteksi otomatis simbol Kconfig untuk Manual Hook di BakaSU
 manual_syms = set(["KSU_MANUAL_HOOK"])
@@ -158,7 +169,7 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
 else:
     print(f"[OK] Header compat/syscall_no.h berhasil di-generate ({sys_h.stat().st_size} bytes)")
 
-# Susun daftar objek .o untuk Makefile 4.4
+# Susun daftar objek .o KHUSUS arsitektur arm64 (lewati x86_64, arm32, riscv64)
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -167,12 +178,15 @@ for line in raw.splitlines():
         continue
     if s.startswith(("ifeq ", "ifneq ", "ifdef ", "ifndef ")):
         low = s.lower()
-        if any(k in low for k in ("susfs", "lkm", "tracepoint", "kprobes")):
-            is_neg = s.startswith(("ifneq ", "ifndef "))
+        is_neg = s.startswith(("ifneq ", "ifndef "))
+        if any(k in low for k in ("susfs", "lkm", "tracepoint", "kprobes", "syscall_hook", "inline_hook")):
             skip_stack.append(not is_neg)
         elif "manual" in low and "hook" in low:
-            is_neg = s.startswith(("ifneq ", "ifndef "))
             skip_stack.append(is_neg)
+        elif any(k in low for k in ("config_arm64", "aarch64")):
+            skip_stack.append(is_neg)
+        elif any(k in low for k in ("config_arm", "config_x86", "config_riscv", "arm32", "x86_64", "riscv")):
+            skip_stack.append(not is_neg)
         else:
             skip_stack.append(False)
         continue
@@ -193,18 +207,23 @@ for s in active_lines:
         part = s.split("=", 1)[1]
         for tok in part.split():
             tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
-            if tok.endswith(".o") and tok != "kernelsu.o" and tok not in objs:
+            if not tok.endswith(".o") or tok == "kernelsu.o":
+                continue
+            if any(arch in tok.lower() for arch in ("x86", "arm32", "riscv", "hook/arm/")):
+                continue
+            if tok not in objs:
                 objs.append(tok)
 
 if not objs:
     for p in sorted(ksu_dir.rglob("*.c")):
         rel = p.relative_to(ksu_dir).as_posix()
-        if not any(x in rel.lower() for x in ("test", "example", "susfs", "lkm", "tracepoint", "kprobes")):
-            objs.append(rel[:-2] + ".o")
+        if any(x in rel.lower() for x in ("test", "example", "susfs", "lkm", "tracepoint", "kprobes", "x86", "arm32", "riscv", "hook/arm/")):
+            continue
+        objs.append(rel[:-2] + ".o")
 
 obj_list = " \\\n\t".join(objs)
 manual_defs = " ".join(f"-DCONFIG_{s}=1" for s in sorted(manual_syms))
-mk = f"""# Kbuild 4.4 Makefile for BakaSU
+mk = f"""# Kbuild 4.4 Makefile for BakaSU (arm64 only)
 obj-$(CONFIG_KSU) += kernelsu.o
 kernelsu-objs := {obj_list}
 
@@ -214,6 +233,7 @@ ccflags-y += -I$(srctree)/drivers/kernelsu/compat
 ccflags-y += -I$(srctree)/drivers/kernelsu/core
 ccflags-y += -I$(srctree)/drivers/kernelsu/feature
 ccflags-y += -I$(srctree)/drivers/kernelsu/hook
+ccflags-y += -I$(srctree)/drivers/kernelsu/hook/arm64
 ccflags-y += -I$(srctree)/drivers/kernelsu/infra
 ccflags-y += -I$(srctree)/drivers/kernelsu/manager
 ccflags-y += -I$(srctree)/drivers/kernelsu/policy
@@ -237,7 +257,7 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-v
 subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
-print(f"[OK] Makefile Kbuild 4.4 dibuat ({len(objs)} objek)")
+print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
 # Pastikan variabel hook global tidak tertahan keyword 'static'
 for cfile in ksu_dir.rglob("*.c"):
