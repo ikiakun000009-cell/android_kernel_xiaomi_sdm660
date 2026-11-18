@@ -35,11 +35,11 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU menjadi Makefile murni Linux 4.4 + header SELinux
+# 2b. Konversi Kbuild BakaSU (multi-line) menjadi Makefile Kbuild 4.4 + hapus duplikat backport
 if [ -d "drivers/kernelsu" ]; then
-    echo "[INFO] Mengonversi Kbuild BakaSU ke Makefile Kbuild 4.4..."
+    echo "[INFO] Menyesuaikan Makefile dan compat header BakaSU untuk kernel 4.4.302..."
     python3 - << 'EOF'
-import pathlib
+import pathlib, re
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
@@ -52,22 +52,52 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-objs = []
+# Gabungkan baris lanjutan '\' agar semua file .o terbaca lengkap
+raw = re.sub(r'\\\r?\n', ' ', raw)
+
+active_lines = []
+skip_stack = []
 for line in raw.splitlines():
     s = line.strip()
-    if s.startswith("#") or any(x in s.lower() for x in ("susfs", "lkm", "tracepoint")):
+    if not s or s.startswith("#"):
         continue
-    if "kernelsu-objs" in s or "kernelsu-y" in s:
-        part = s.split("=", 1)[1] if "=" in s else ""
-        for tok in part.replace("\\", " ").split():
+    if s.startswith(("ifeq ", "ifneq ", "ifdef ", "ifndef ")):
+        low = s.lower()
+        if any(k in low for k in ("susfs", "lkm", "tracepoint", "kprobes")):
+            is_neg = s.startswith(("ifneq ", "ifndef "))
+            skip_stack.append(not is_neg)
+        elif "manual_hook" in low:
+            is_neg = s.startswith(("ifneq ", "ifndef "))
+            skip_stack.append(is_neg)
+        else:
+            skip_stack.append(False)
+        continue
+    elif s == "else":
+        if skip_stack:
+            skip_stack[-1] = not skip_stack[-1]
+        continue
+    elif s == "endif":
+        if skip_stack:
+            skip_stack.pop()
+        continue
+
+    if any(skip_stack):
+        continue
+    active_lines.append(s)
+
+objs = []
+for s in active_lines:
+    if re.match(r'^(kernelsu-objs|kernelsu-y|obj-\$\(CONFIG_KSU\))\s*[:+]?=', s):
+        part = s.split("=", 1)[1]
+        for tok in part.split():
             tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
-            if tok.endswith(".o") and tok not in objs:
+            if tok.endswith(".o") and tok != "kernelsu.o" and tok not in objs:
                 objs.append(tok)
 
 if not objs:
     for p in sorted(ksu_dir.rglob("*.c")):
         rel = p.relative_to(ksu_dir).as_posix()
-        if not any(x in rel.lower() for x in ("test", "example", "susfs", "lkm", "tracepoint")):
+        if not any(x in rel.lower() for x in ("test", "example", "susfs", "lkm", "tracepoint", "kprobes")):
             objs.append(rel[:-2] + ".o")
 
 obj_list = " \\\n\t".join(objs)
@@ -79,6 +109,7 @@ ccflags-y += -I$(srctree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/drivers/kernelsu/include
 ccflags-y += -I$(srctree)/drivers/kernelsu/compat
 ccflags-y += -I$(srctree)/drivers/kernelsu/core
+ccflags-y += -I$(srctree)/drivers/kernelsu/runtime
 ccflags-y += -I$(srctree)/drivers/kernelsu/selinux
 ccflags-y += -I$(srctree)/KernelSU/kernel
 ccflags-y += -I$(srctree)/KernelSU/kernel/include
@@ -94,7 +125,62 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-v
 subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
-print("[OK] Makefile BakaSU dibuat dengan header SELinux & objek:", ", ".join(objs))
+print(f"[OK] Makefile BakaSU dibuat ({len(objs)} objek):", ", ".join(objs))
+
+# Pastikan variabel hook global tidak tertahan keyword 'static'
+for cfile in ksu_dir.rglob("*.c"):
+    ctxt = cfile.read_text(errors="ignore")
+    new_ctxt = re.sub(
+        r'\bstatic\s+(bool\s+ksu_(?:execveat|vfs_read|input)_hook\b)',
+        r'\1',
+        ctxt
+    )
+    if new_ctxt != ctxt:
+        cfile.write_text(new_ctxt)
+
+# Pindai header include/linux/*.h untuk mencegah redefinition (seperti inode_lock/inode_unlock)
+existing_funcs = set()
+for hdr in pathlib.Path("include/linux").glob("*.h"):
+    try:
+        htxt = hdr.read_text(errors="ignore")
+        for m in re.finditer(r'\bstatic\s+inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\(', htxt):
+            existing_funcs.add(m.group(1))
+        for m in re.finditer(r'^\s*#\s*define\s+([a-zA-Z_]\w*)\s*\(', htxt, re.M):
+            existing_funcs.add(m.group(1))
+    except Exception:
+        pass
+
+kc_path = ksu_dir / "compat" / "kernel_compat.h"
+if kc_path.exists():
+    kc = kc_path.read_text()
+    pat = re.compile(r'\bstatic\s+inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\([^;\{]*?\)\s*\{')
+    out = []
+    idx = 0
+    removed = []
+    while idx < len(kc):
+        m = pat.search(kc, idx)
+        if not m:
+            out.append(kc[idx:])
+            break
+        fn_name = m.group(1)
+        brace_start = m.end() - 1
+        depth = 1
+        j = brace_start + 1
+        while j < len(kc) and depth > 0:
+            if kc[j] == '{':
+                depth += 1
+            elif kc[j] == '}':
+                depth -= 1
+            j += 1
+        if fn_name in existing_funcs:
+            out.append(kc[idx:m.start()])
+            out.append(f"/* [4.4.302-compat] {fn_name} sudah ada di header kernel */\n")
+            removed.append(fn_name)
+        else:
+            out.append(kc[idx:j])
+        idx = j
+    kc_path.write_text("".join(out))
+    print("[OK] Duplikat di kernel_compat.h dihapus:", ", ".join(removed) if removed else "tidak ada")
 EOF
 fi
 
