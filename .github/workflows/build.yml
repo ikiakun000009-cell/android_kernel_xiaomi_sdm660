@@ -13,7 +13,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex git gnupg gperf libelf-dev libncurses5-dev libssl-dev libxml2-utils lzop python3 unzip wget zip
+          sudo apt-get install -y bc bison build-essential ccache curl flex git gnupg gperf libelf-dev libncurses5-dev libssl-dev libxml2-utils lzop python3 unzip wget zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       - name: Download Clang Toolchain
         run: |
@@ -55,10 +55,10 @@ jobs:
           EOF
           cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/
           cd AnyKernel3
-          zip -r9 ../Lavender-4.4-BakaSU-NoMount.zip * -x .git README.md *placeholder
+          zip -r9 ../Lavender-4.4-XtrSolRadical-BakaSU-NoMount.zip * -x .git README.md *placeholder
 
       - name: Upload Hasil ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: Lavender-4.4-BakaSU-NoMount
-          path: Lavender-4.4-BakaSU-NoMount.zip
+          name: Lavender-4.4-XtrSolRadical-BakaSU-NoMount
+          path: Lavender-4.4-XtrSolRadical-BakaSU-NoMount.zip
