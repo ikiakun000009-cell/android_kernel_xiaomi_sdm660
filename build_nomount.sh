@@ -38,11 +38,11 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Konversi Kbuild BakaSU & tambal kompatibilitas API Linux 4.4.302
+# 2b. Konversi Kbuild BakaSU, generate compat/syscall_no.h, & tambal API Linux 4.4.302
 if [ -d "drivers/kernelsu" ]; then
-    echo "[INFO] Menyesuaikan Kbuild dan kompatibilitas Linux 4.4.302 pada BakaSU..."
+    echo "[INFO] Menyesuaikan Kbuild, header generator, dan kompatibilitas 4.4.302 pada BakaSU..."
     DEFCONFIG_FILE="$DEFCONFIG_PATH" python3 - << 'EOF'
-import os, pathlib, re
+import os, pathlib, re, subprocess
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
@@ -71,7 +71,7 @@ for sym in sorted(manual_syms):
 defcfg_p.write_text(dtxt + "\n")
 print("[OK] Kconfig Manual Hook aktif:", ", ".join(sorted(manual_syms)))
 
-# Parse Kbuild BakaSU (gabungkan baris lanjutan '\')
+# Baca Kbuild BakaSU sebelum dikonversi ke Makefile 4.4
 raw = ""
 if kbuild_f.exists():
     raw = kbuild_f.read_text()
@@ -80,6 +80,85 @@ elif makefile_f.exists():
     raw = makefile_f.read_text()
 
 raw = re.sub(r'\\\r?\n', ' ', raw)
+
+# Jalankan aturan generator header (.h) dari Kbuild (seperti compat/syscall_no.h)
+cmds = {}
+for m in re.finditer(r'^\s*cmd_([A-Za-z0-9_]+)\s*:?=\s*(.+)$', raw, re.M):
+    cmds[m.group(1)] = m.group(2).strip()
+
+for m in re.finditer(r'^\s*([^\s:#]+\.h)\s*:\s*([^\n]+)', raw, re.M):
+    target_raw = m.group(1).strip()
+    deps_raw = m.group(2).strip()
+    pos = m.end()
+    recipe_lines = []
+    for rline in raw[pos:].splitlines():
+        if not rline.strip():
+            continue
+        if rline.startswith(("\t", " ")) and not rline.lstrip().startswith("#"):
+            recipe_lines.append(rline.strip())
+        else:
+            break
+    if not recipe_lines:
+        continue
+
+    def expand_vars(s, tgt, deps):
+        first_dep = deps.split()[0] if deps.split() else ""
+        s = s.replace("$@", tgt).replace("$<", first_dep).replace("$^", deps)
+        s = s.replace("$(srctree)", ".").replace("$(objtree)", ".")
+        s = s.replace("$(src)", "drivers/kernelsu").replace("$(obj)", "drivers/kernelsu")
+        s = s.replace("$(SRCARCH)", "arm64").replace("$(ARCH)", "arm64")
+        s = s.replace("$(CC)", "clang").replace("$(CPP)", "clang -E")
+        s = s.replace("$(HOSTCC)", "gcc").replace("$(AWK)", "awk")
+        s = s.replace("$(SED)", "sed").replace("$(PERL)", "perl")
+        s = s.replace("$(PYTHON3)", "python3").replace("$(PYTHON)", "python3")
+        return s
+
+    tgt_path = expand_vars(target_raw, "", "")
+    deps_exp = expand_vars(deps_raw, tgt_path, "")
+    pathlib.Path(tgt_path).parent.mkdir(parents=True, exist_ok=True)
+
+    for r in recipe_lines:
+        cm = re.match(r'^\$\(call\s+(?:if_changed(?:_dep|_rule)?,)?cmd,([A-Za-z0-9_]+)\)', r)
+        if cm and cm.group(1) in cmds:
+            cmd_str = expand_vars(cmds[cm.group(1)], tgt_path, deps_exp)
+        else:
+            cmd_str = expand_vars(r.lstrip("@- "), tgt_path, deps_exp)
+        print(f"[INFO] Menjalankan generator header: {cmd_str}")
+        subprocess.run(cmd_str, shell=True, check=False)
+
+# Fallback jika compat/syscall_no.h belum terbuat atau kosong
+sys_h = ksu_dir / "compat" / "syscall_no.h"
+if not sys_h.exists() or sys_h.stat().st_size == 0:
+    print("[INFO] Membuat fallback drivers/kernelsu/compat/syscall_no.h...")
+    u32_map = {}
+    u32_p = pathlib.Path("arch/arm64/include/asm/unistd32.h")
+    if u32_p.exists():
+        for line in u32_p.read_text(errors="ignore").splitlines():
+            um = re.match(r'^\s*#\s*define\s+__NR_([A-Za-z0-9_]+)\s+(\d+)', line)
+            if um:
+                u32_map[um.group(1)] = um.group(2)
+    u64_map = {}
+    for up in [pathlib.Path("include/uapi/asm-generic/unistd.h"), pathlib.Path("arch/arm64/include/uapi/asm/unistd.h")]:
+        if up.exists():
+            for line in up.read_text(errors="ignore").splitlines():
+                um = re.match(r'^\s*#\s*define\s+__NR(?:3264)?_([A-Za-z0-9_]+)\s+(\d+)', line)
+                if um:
+                    u64_map[um.group(1)] = um.group(2)
+
+    lines = ["#ifndef __KSU_COMPAT_SYSCALL_NO_H", "#define __KSU_COMPAT_SYSCALL_NO_H", "#include <asm/unistd.h>"]
+    for name, num in sorted(u32_map.items()):
+        lines.append(f"#ifndef __NR_compat_{name}\n#define __NR_compat_{name} {num}\n#endif")
+        lines.append(f"#ifndef KSU_COMPAT_NR_{name}\n#define KSU_COMPAT_NR_{name} {num}\n#endif")
+    for name, num in sorted(u64_map.items()):
+        lines.append(f"#ifndef __NR_{name}\n#define __NR_{name} {num}\n#endif")
+    lines.append("#endif")
+    sys_h.parent.mkdir(parents=True, exist_ok=True)
+    sys_h.write_text("\n".join(lines) + "\n")
+    print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
+else:
+    print(f"[OK] Header compat/syscall_no.h berhasil di-generate ({sys_h.stat().st_size} bytes)")
+
+# Susun daftar objek .o untuk Makefile 4.4
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -133,6 +212,7 @@ ccflags-y += -I$(srctree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/drivers/kernelsu/include
 ccflags-y += -I$(srctree)/drivers/kernelsu/compat
 ccflags-y += -I$(srctree)/drivers/kernelsu/core
+ccflags-y += -I$(srctree)/drivers/kernelsu/feature
 ccflags-y += -I$(srctree)/drivers/kernelsu/hook
 ccflags-y += -I$(srctree)/drivers/kernelsu/infra
 ccflags-y += -I$(srctree)/drivers/kernelsu/manager
@@ -141,6 +221,7 @@ ccflags-y += -I$(srctree)/drivers/kernelsu/runtime
 ccflags-y += -I$(srctree)/drivers/kernelsu/selinux
 ccflags-y += -I$(srctree)/drivers/kernelsu/supercall
 ccflags-y += -I$(srctree)/drivers/kernelsu/uapi
+ccflags-y += -I$(objtree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/KernelSU/kernel
 ccflags-y += -I$(srctree)/KernelSU/kernel/include
 ccflags-y += -I$(srctree)/KernelSU/uapi
@@ -187,7 +268,7 @@ existing_funcs = set()
 for hdr in pathlib.Path("include/linux").glob("*.h"):
     try:
         htxt = hdr.read_text(errors="ignore")
-        for m in re.finditer(r'\bstatic\s+inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\(', htxt):
+        for m in re.finditer(r'\bstatic\s+(?:__always_)?inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\(', htxt):
             existing_funcs.add(m.group(1))
         for m in re.finditer(r'^\s*#\s*define\s+([a-zA-Z_]\w*)\s*\(', htxt, re.M):
             existing_funcs.add(m.group(1))
@@ -197,7 +278,7 @@ for hdr in pathlib.Path("include/linux").glob("*.h"):
 kc_path = ksu_dir / "compat" / "kernel_compat.h"
 if kc_path.exists():
     kc = kc_path.read_text()
-    pat = re.compile(r'\bstatic\s+inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\([^;\{]*?\)\s*\{')
+    pat = re.compile(r'\bstatic\s+(?:__always_)?inline\s+[^;\{]+?\b([a-zA-Z_]\w*)\s*\([^;\{]*?\)\s*\{')
     out = []
     idx = 0
     removed = []
