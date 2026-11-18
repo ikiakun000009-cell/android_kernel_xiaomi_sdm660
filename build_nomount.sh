@@ -17,7 +17,7 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Ambil source BakaSU asli dari manifest/konfigurasi OnePlus-BakaSu_NMS
+# 2. Ambil source BakaSU / KernelSU-Next
 if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Membaca manifest BakaSU dari $BAKASU_META_REPO..."
     rm -rf /tmp/bakasu_meta KernelSU
@@ -38,13 +38,10 @@ if [ ! -e "drivers/kernelsu" ]; then
         echo "[INFO] Mengkloning source BakaSU terdeteksi: $FOUND_REPO"
         git clone --depth=1 "$FOUND_REPO" KernelSU
     else
-        echo "[INFO] Menampilkan referensi dari manifest:"
-        grep -rnE "http|Baka|ksu" /tmp/bakasu_meta/manifests /tmp/bakasu_meta/README.md 2>/dev/null | head -n 15 || true
-        echo "[INFO] Menggunakan fallback KernelSU-Next..."
+        echo "[INFO] Menggunakan KernelSU-Next..."
         curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
     fi
 
-    # Pastikan symlink drivers/kernelsu terpasang jika belum dibuat oleh setup.sh
     if [ ! -e "drivers/kernelsu" ] && [ -d "KernelSU" ]; then
         if [ -f "KernelSU/kernel/Kconfig" ]; then
             ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
@@ -56,15 +53,139 @@ if [ ! -e "drivers/kernelsu" ]; then
     fi
 fi
 
-# 3. Integrasi NoMount (hanya dipasang jika belum ada di dalam source tree)
+# 3. Integrasi NoMount (branch dev)
 if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ fs/ drivers/ 2>/dev/null; then
     echo "[INFO] Memasang NoMount (branch dev)..."
     curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
-else
-    echo "[INFO] Dukungan NoMount sudah terdeteksi di source tree."
 fi
 
-# 4. Aktifkan flag kernel 4.4 yang diperlukan
+# 4. Patch kompatibilitas VFS Linux 4.4 untuk fs/nomount
+if [ -d "fs/nomount" ]; then
+    echo "[INFO] Menerapkan patch kompatibilitas Linux 4.4 pada fs/nomount..."
+    python3 - << 'EOF'
+import re, pathlib
+
+def strip_first_arg(code, func_name):
+    out = []
+    i = 0
+    n = len(code)
+    pat = re.compile(r'\b' + re.escape(func_name) + r'\s*\(')
+    while i < n:
+        m = pat.search(code, i)
+        if not m:
+            out.append(code[i:])
+            break
+        out.append(code[i:m.end()])
+        start = m.end()
+        depth = 1
+        j = start
+        first_comma = -1
+        while j < n and depth > 0:
+            ch = code[j]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == ',' and depth == 1 and first_comma == -1:
+                first_comma = j
+            j += 1
+        if first_comma != -1:
+            out.append(code[first_comma + 1:j].lstrip())
+        else:
+            out.append(code[start:j])
+        i = j
+    return ''.join(out)
+
+# Patch nomount.h
+h_path = pathlib.Path("fs/nomount/nomount.h")
+if h_path.exists():
+    h = h_path.read_text()
+    if "<linux/compat.h>" not in h:
+        h = "#include <linux/compat.h>\n" + h
+    h = h.replace("in_compat_syscall()", "is_compat_task()")
+    h = h.replace("iterate_shared", "iterate")
+    h = strip_first_arg(h, "full_name_hash")
+    lookup_fn = (
+        "static inline struct dentry *nm_lookup_one_len_unlocked(const char *name, struct dentry *base, int len)\n"
+        "{\n"
+        "    struct dentry *d;\n"
+        "    mutex_lock(&base->d_inode->i_mutex);\n"
+        "    d = lookup_one_len(name, base, len);\n"
+        "    mutex_unlock(&base->d_inode->i_mutex);\n"
+        "    return d;\n"
+        "}"
+    )
+    h = re.sub(r'#\s*define\s+nm_lookup_one_len_unlocked\s+lookup_one_len_unlocked', lookup_fn, h)
+    h_path.write_text(h)
+
+# Patch nomount.c
+c_path = pathlib.Path("fs/nomount/nomount.c")
+if c_path.exists():
+    c = c_path.read_text()
+    c = c.replace("iterate_shared", "iterate")
+    c = strip_first_arg(c, "full_name_hash")
+
+    # 4.4 rename() hanya menerima 4 argumen (tanpa flags)
+    c = re.sub(
+        r'(static\s+int\s+nm_rename\s*\([^)]*?),\s*unsigned\s+int\s+flags\s*\)\s*\{',
+        r'\1)\n{\n    unsigned int flags = 0;',
+        c
+    )
+    c = re.sub(r'(->rename\s*\([^;]*?),\s*flags\s*\)', r'\1)', c)
+
+    # 4.4 memakai follow_link(dentry, cookie) bukan get_link(dentry, inode, done)
+    c = re.sub(
+        r'static\s+const\s+char\s*\*\s*nm_get_link\s*\(\s*struct\s+dentry\s*\*\s*dentry\s*,\s*struct\s+inode\s*\*\s*inode\s*,\s*struct\s+delayed_call\s*\*\s*done\s*\)\s*\{',
+        'static const char *nm_follow_link(struct dentry *dentry, void **cookie)\n{\n    struct inode *inode = d_inode(dentry);',
+        c
+    )
+    c = c.replace("->get_link(target_dentry, real_inode, done)", "->follow_link(target_dentry, cookie)")
+    c = c.replace("->get_link", "->follow_link")
+    c = c.replace(".get_link = nm_get_link", ".follow_link = nm_follow_link")
+    c = c.replace(".get_link = nm_follow_link", ".follow_link = nm_follow_link")
+
+    # 4.4 xattr menggunakan vfs_getxattr(dentry, name, buf, size) dan handler tanpa inode
+    c = re.sub(
+        r'__vfs_getxattr\s*\(\s*([^,]+),\s*d_inode\([^)]+\)\s*,\s*([^,]+),\s*([^,]+),\s*([^,\)]+)[^\)]*\)',
+        r'vfs_getxattr(\1, \2, \3, \4)',
+        c
+    )
+    c = re.sub(
+        r'(static\s+int\s+nm_xattr_get\s*\(\s*const\s+struct\s+xattr_handler\s*\*\s*\w+\s*,\s*struct\s+dentry\s*\*\s*dentry\s*,)\s*struct\s+inode\s*\*\s*inode\s*,',
+        r'\1',
+        c
+    )
+    c = re.sub(
+        r'(static\s+int\s+nm_xattr_get\s*\([^)]+\)\s*\{)',
+        r'\1\n    struct inode *inode = d_inode(dentry);',
+        c
+    )
+    c = re.sub(
+        r'(static\s+int\s+nm_xattr_set\s*\(\s*const\s+struct\s+xattr_handler\s*\*\s*\w+\s*,)\s*[^,]*\bstruct\s+dentry\s*\*\s*dentry\s*,\s*struct\s+inode\s*\*\s*inode\s*,',
+        r'\1 struct dentry *dentry,',
+        c
+    )
+    c = re.sub(
+        r'(static\s+int\s+nm_xattr_set\s*\([^)]+\)\s*\{)',
+        r'\1\n    struct inode *inode = d_inode(dentry);',
+        c
+    )
+    c = re.sub(
+        r'proxy->orig->get\s*\(\s*proxy->orig\s*,\s*dentry\s*,\s*inode\s*,\s*name\s*,\s*buffer\s*,\s*size[^\)]*\)',
+        'proxy->orig->get(proxy->orig, dentry, name, buffer, size)',
+        c
+    )
+    c = re.sub(
+        r'proxy->orig->set\s*\(\s*proxy->orig\s*,[^,]*\bdentry\s*,\s*inode\s*,\s*name\s*,\s*buffer\s*,\s*size\s*,\s*flags\s*\)',
+        'proxy->orig->set(proxy->orig, dentry, name, buffer, size, flags)',
+        c
+    )
+    c_path.write_text(c)
+print("[INFO] Patch Linux 4.4 pada fs/nomount selesai.")
+EOF
+fi
+
+# 5. Aktifkan flag kernel 4.4 yang diperlukan
 for cfg in \
     CONFIG_NOMOUNT=y \
     CONFIG_KSU=y \
@@ -77,7 +198,7 @@ for cfg in \
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 5. Compile kernel 4.4 sdm660 (Clang + GNU Linker + bypass warning C lama)
+# 6. Compile kernel 4.4 sdm660 (Clang + GNU Linker + bypass warning C lama)
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
