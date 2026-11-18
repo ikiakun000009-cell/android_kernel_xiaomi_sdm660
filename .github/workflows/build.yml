@@ -1,29 +1,64 @@
-- name: Bungkus ke AnyKernel3
-    run: |
-      git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
-      cat << 'EOF' > AnyKernel3/anykernel.sh
-      properties() { '
-      kernel.string=Lavender 4.4 BakaSU + NoMount
-      do.devicecheck=0
-      do.modules=0
-      do.systemless=1
-      do.cleanup=1
-      do.cleanuponabort=0
-      device.name1=lavender
-      supported.versions=
-      supported.patchlevels=
-      '; }
+name: Build Lavender 4.4 BakaSU + NoMount
 
-      BLOCK=/dev/block/bootdevice/by-name/boot;
-      IS_SLOT_DEVICE=0;
-      RAMDISK_COMPRESSION=auto;
-      PATCH_VBMETA_FLAG=auto;
+on:
+  workflow_dispatch:
 
-      . tools/ak3-core.sh;
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Kernel
+        uses: actions/checkout@v4
 
-      split_boot;
-      flash_boot;
-      EOF
-      cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/
-      cd AnyKernel3
-      zip -r9 ../Lavender-4.4-BakaSU-NoMount.zip * -x .git README.md *placeholder
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git gnupg gperf libelf-dev libncurses5-dev libssl-dev libxml2-utils lzop python3 unzip wget zip
+
+      - name: Download Clang Toolchain
+        run: |
+          mkdir -p clang
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          rm -f clang.tar.gz
+
+      - name: Jalankan Build 4.4 BakaSU + NoMount
+        run: |
+          chmod +x build_nomount.sh
+          ./build_nomount.sh
+
+      - name: Bungkus ke AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          properties() { '
+          kernel.string=XtrSolRadical 4.4 BakaSU + NoMount
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=lavender
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          cd AnyKernel3
+          zip -r9 ../Lavender-4.4-BakaSU-NoMount.zip * -x .git README.md *placeholder
+
+      - name: Upload Hasil ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lavender-4.4-BakaSU-NoMount
+          path: Lavender-4.4-BakaSU-NoMount.zip
