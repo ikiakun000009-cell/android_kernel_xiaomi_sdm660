@@ -2,7 +2,7 @@
 set -e
 
 CLANG_DIR="$PWD/clang/bin"
-BAKASU_REPO="https://github.com/Bouteillepleine/OnePlus-BakaSu_NMS.git"
+BAKASU_META_REPO="https://github.com/Bouteillepleine/OnePlus-BakaSu_NMS.git"
 
 # 1. Cari defconfig Redmi Note 7 (prioritas varian perf)
 DEFCONFIG_PATH=$(find arch/arm64/configs -name "*lavender*perf_defconfig" | head -n 1)
@@ -17,36 +17,46 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU_NMS (deteksi otomatis letak folder Kconfig)
+# 2. Ambil source BakaSU asli dari manifest/konfigurasi OnePlus-BakaSu_NMS
 if [ ! -e "drivers/kernelsu" ]; then
-    echo "[INFO] Memasang BakaSU_NMS dari $BAKASU_REPO..."
-    BAKASU_BRANCH=$(git ls-remote --symref "$BAKASU_REPO" HEAD | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2}')
-    [ -z "$BAKASU_BRANCH" ] && BAKASU_BRANCH="NoMount"
-    echo "[INFO] Branch BakaSU terdeteksi: $BAKASU_BRANCH"
+    echo "[INFO] Membaca manifest BakaSU dari $BAKASU_META_REPO..."
+    rm -rf /tmp/bakasu_meta KernelSU
+    git clone --depth=1 "$BAKASU_META_REPO" /tmp/bakasu_meta
 
-    rm -rf KernelSU
-    git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
+    FOUND_SETUP=$(grep -rhoE 'https://raw\.githubusercontent\.com/[^"'\''[:space:])]+setup\.sh' /tmp/bakasu_meta 2>/dev/null | head -n 1 || true)
+    FOUND_REPO=$(grep -rhoE 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' /tmp/bakasu_meta 2>/dev/null | grep -vi "OnePlus-BakaSu_NMS" | grep -iE "bakasu|kernelsu|sukisu" | head -n 1 || true)
 
-    if [ -f "KernelSU/kernel/Kconfig" ]; then
-        ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
-    elif [ -f "KernelSU/Kconfig" ]; then
-        ln -sfn "$(pwd)/KernelSU" drivers/kernelsu
-    else
-        KSU_KCONFIG=$(find KernelSU -maxdepth 3 -name "Kconfig" | head -n 1)
-        if [ -n "$KSU_KCONFIG" ]; then
-            ln -sfn "$(pwd)/$(dirname "$KSU_KCONFIG")" drivers/kernelsu
+    if [ -n "$FOUND_SETUP" ]; then
+        echo "[INFO] Menjalankan setup.sh dari manifest: $FOUND_SETUP"
+        SETUP_ARG=$(grep -hoE "${FOUND_SETUP}[^|]*\|[[:space:]]*bash[[:space:]]+-s[[:space:]]+[A-Za-z0-9_.-]+" /tmp/bakasu_meta 2>/dev/null | awk '{print $NF}' | head -n 1 || true)
+        if [ -n "$SETUP_ARG" ]; then
+            curl -fsSL "$FOUND_SETUP" | bash -s "$SETUP_ARG"
         else
-            echo "[ERROR] File Kconfig tidak ditemukan di dalam repo BakaSU!"
-            ls -la KernelSU
-            exit 1
+            curl -fsSL "$FOUND_SETUP" | bash -
         fi
+    elif [ -n "$FOUND_REPO" ]; then
+        echo "[INFO] Mengkloning source BakaSU terdeteksi: $FOUND_REPO"
+        git clone --depth=1 "$FOUND_REPO" KernelSU
+    else
+        echo "[INFO] Menampilkan referensi dari manifest:"
+        grep -rnE "http|Baka|ksu" /tmp/bakasu_meta/manifests /tmp/bakasu_meta/README.md 2>/dev/null | head -n 15 || true
+        echo "[INFO] Menggunakan fallback KernelSU-Next..."
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
     fi
 
-    grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-    grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+    # Pastikan symlink drivers/kernelsu terpasang jika belum dibuat oleh setup.sh
+    if [ ! -e "drivers/kernelsu" ] && [ -d "KernelSU" ]; then
+        if [ -f "KernelSU/kernel/Kconfig" ]; then
+            ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
+        elif [ -f "KernelSU/Kconfig" ]; then
+            ln -sfn "$(pwd)/KernelSU" drivers/kernelsu
+        fi
+        grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+    fi
 fi
 
-# 3. Integrasi NoMount (hanya dipasang jika belum ada di dalam BakaSU_NMS)
+# 3. Integrasi NoMount (hanya dipasang jika belum ada di dalam source tree)
 if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ fs/ drivers/ 2>/dev/null; then
     echo "[INFO] Memasang NoMount (branch dev)..."
     curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
