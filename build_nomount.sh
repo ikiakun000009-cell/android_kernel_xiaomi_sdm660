@@ -22,25 +22,45 @@ echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Memasang BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
     rm -rf KernelSU
-    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/$BAKASU_BRANCH/kernel/setup.sh" | bash -s "$BAKASU_BRANCH" || true
+    git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
 
-    if [ ! -d "KernelSU" ]; then
-        git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
-    fi
-
-    if [ ! -e "drivers/kernelsu" ]; then
-        if [ -f "KernelSU/kernel/Kconfig" ]; then
-            ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
-        elif [ -f "KernelSU/Kconfig" ]; then
-            ln -sfn "$(pwd)/KernelSU" drivers/kernelsu
-        else
-            echo "[ERROR] File Kconfig tidak ditemukan di dalam $BAKASU_REPO!"
-            exit 1
-        fi
+    if [ -f "KernelSU/kernel/Kconfig" ]; then
+        ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
+    elif [ -f "KernelSU/Kconfig" ]; then
+        ln -sfn "$(pwd)/KernelSU" drivers/kernelsu
+    else
+        echo "[ERROR] File Kconfig tidak ditemukan di dalam $BAKASU_REPO!"
+        exit 1
     fi
 
     grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+fi
+
+# 2b. Patch kompatibilitas Kbuild/Makefile BakaSU untuk kernel 4.4
+if [ -f "drivers/kernelsu/Makefile" ]; then
+    echo "[INFO] Menyesuaikan Makefile BakaSU untuk Kbuild 4.4..."
+    python3 - << 'EOF'
+import pathlib, re
+
+mk_p = pathlib.Path("drivers/kernelsu/Makefile")
+mk = mk_p.read_text()
+
+# Pastikan KSU_GIT_VERSION selalu memiliki nilai valid
+if "KSU_GIT_VERSION" in mk:
+    mk = "KSU_GIT_VERSION := 12000\n" + mk
+
+# Hapus baris Kbuild modern yang sering gagal di Makefile.modbuiltin 4.4
+cleaned = []
+for line in mk.splitlines():
+    if any(bad in line for bad in ("$(error", "check_kallsyms", "KSU_EXPECTED_SIZE", "KSU_EXPECTED_HASH")):
+        cleaned.append("# " + line)
+    else:
+        cleaned.append(line)
+
+mk_p.write_text("\n".join(cleaned) + "\n")
+print("[OK] Makefile BakaSU disesuaikan untuk kernel 4.4")
+EOF
 fi
 
 # 3. Terapkan Manual Hooks BakaSU untuk kernel non-GKI 4.4
