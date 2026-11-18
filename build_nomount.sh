@@ -94,6 +94,8 @@ shim_lines = [
     "#include <linux/types.h>",
     "#include <linux/slab.h>",
     "#include <linux/vmalloc.h>",
+    "#include <linux/mm.h>",
+    "#include <asm/pgtable.h>",
     "#include <linux/string.h>",
     "#include <linux/ktime.h>",
     "#include <linux/compat.h>",
@@ -701,7 +703,7 @@ for cfg in \
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 7. Compile kernel 4.4 sdm660 (tangkap baris error murni jika gagal)
+# 7. Compile khusus drivers/kernelsu/ dengan -k dulu agar semua sisa error tampil sekaligus
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
@@ -709,7 +711,23 @@ export KBUILD_BUILD_USER="XtRs"
 export KBUILD_BUILD_HOST="Lavender"
 
 make O=out ARCH=arm64 "$DEFCONFIG"
+make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- prepare
 
+if ! make -k -j"$(nproc --all)" O=out \
+    ARCH=arm64 \
+    CC=clang \
+    CLANG_TRIPLE=aarch64-linux-gnu- \
+    CROSS_COMPILE=aarch64-linux-gnu- \
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+    KCFLAGS="-Wno-error" \
+    drivers/kernelsu/ 2>&1 | tee /tmp/ksu_check.log; then
+    echo "================ ALL REMAINING BAKASU ERRORS ================"
+    grep -n -C 2 -E ":\s*(fatal )?error:" /tmp/ksu_check.log || true
+    echo "============================================================="
+    exit 1
+fi
+
+# 8. Lanjutkan full build kernel 4.4 sdm660 hingga selesai
 if ! make -j"$(nproc --all)" O=out \
     ARCH=arm64 \
     CC=clang \
