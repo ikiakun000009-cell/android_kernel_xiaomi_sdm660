@@ -1,43 +1,29 @@
-name: Build Lavender 4.4 BakaSU + NoMount
+- name: Bungkus ke AnyKernel3
+    run: |
+      git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+      cat << 'EOF' > AnyKernel3/anykernel.sh
+      properties() { '
+      kernel.string=Lavender 4.4 BakaSU + NoMount
+      do.devicecheck=0
+      do.modules=0
+      do.systemless=1
+      do.cleanup=1
+      do.cleanuponabort=0
+      device.name1=lavender
+      supported.versions=
+      supported.patchlevels=
+      '; }
 
-on:
-  workflow_dispatch:
+      BLOCK=/dev/block/bootdevice/by-name/boot;
+      IS_SLOT_DEVICE=0;
+      RAMDISK_COMPRESSION=auto;
+      PATCH_VBMETA_FLAG=auto;
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Source Kernel
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      . tools/ak3-core.sh;
 
-      - name: Install Dependensi & Python Symlink
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex git libssl-dev libelf-dev python3 python-is-python3 zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-
-      - name: Clone Toolchain Clang
-        run: |
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git clang
-
-      - name: Jalankan Build 4.4 BakaSU + NoMount
-        run: |
-          chmod +x build_nomount.sh
-          ./build_nomount.sh
-
-      - name: Bungkus ke AnyKernel3
-        run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-          sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|g' AnyKernel3/anykernel.sh
-          sed -i 's/is_slot_device=1/is_slot_device=0/g' AnyKernel3/anykernel.sh
-          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/
-          cd AnyKernel3
-          zip -r9 ../Lavender-4.4-BakaSU-NoMount.zip * -x .git README.md *placeholder
-
-      - name: Upload Hasil ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: Lavender-4.4-BakaSU-NoMount
-          path: Lavender-4.4-BakaSU-NoMount.zip
+      split_boot;
+      flash_boot;
+      EOF
+      cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ || cp out/arch/arm64/boot/Image.gz AnyKernel3/
+      cd AnyKernel3
+      zip -r9 ../Lavender-4.4-BakaSU-NoMount.zip * -x .git README.md *placeholder
