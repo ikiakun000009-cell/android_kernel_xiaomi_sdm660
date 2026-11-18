@@ -18,55 +18,76 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU (branch main)
+# 2. Integrasi BakaSU (salin langsung tanpa symlink agar aman untuk O=out 4.4)
 if [ ! -e "drivers/kernelsu" ]; then
-    echo "[INFO] Memasang BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
-    rm -rf KernelSU
+    echo "[INFO] Mengkloning BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
+    rm -rf KernelSU drivers/kernelsu
     git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
 
-    if [ -f "KernelSU/kernel/Kconfig" ]; then
-        ln -sfn "$(pwd)/KernelSU/kernel" drivers/kernelsu
-    elif [ -f "KernelSU/Kconfig" ]; then
-        ln -sfn "$(pwd)/KernelSU" drivers/kernelsu
+    if [ -d "KernelSU/kernel" ]; then
+        cp -rf KernelSU/kernel drivers/kernelsu
     else
-        echo "[ERROR] File Kconfig tidak ditemukan di dalam $BAKASU_REPO!"
-        exit 1
+        cp -rf KernelSU drivers/kernelsu
     fi
+    [ -d "KernelSU/uapi" ] && [ ! -e "drivers/uapi" ] && cp -rf KernelSU/uapi drivers/uapi
 
     grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Tulis ulang Makefile BakaSU ke format Kbuild murni Linux 4.4 (fix Makefile.modbuiltin Error 2)
+# 2b. Konversi Kbuild BakaSU menjadi Makefile murni Linux 4.4
 if [ -d "drivers/kernelsu" ]; then
-    echo "[INFO] Membangun ulang drivers/kernelsu/Makefile kompatibel Kbuild 4.4..."
+    echo "[INFO] Mengonversi Kbuild BakaSU ke Makefile Kbuild 4.4..."
     python3 - << 'EOF'
-import pathlib, os
+import pathlib, re
 
-ksu_dir = pathlib.Path("drivers/kernelsu").resolve()
-c_files = []
-for p in sorted(ksu_dir.rglob("*.c")):
-    rel = p.relative_to(ksu_dir).as_posix()
-    # Abaikan file test atau tools userspace jika ada
-    if any(skip in rel.lower() for skip in ("test", "selftest", "example")):
+ksu_dir = pathlib.Path("drivers/kernelsu")
+kbuild_f = ksu_dir / "Kbuild"
+makefile_f = ksu_dir / "Makefile"
+
+raw = ""
+if kbuild_f.exists():
+    raw = kbuild_f.read_text()
+    kbuild_f.unlink()
+elif makefile_f.exists():
+    raw = makefile_f.read_text()
+
+# Ekstrak daftar file .o dari Kbuild bawaan BakaSU, fallback ke scan *.c jika kosong
+objs = []
+for line in raw.splitlines():
+    s = line.strip()
+    if s.startswith("#") or "susfs" in s.lower() or "lkm" in s.lower():
         continue
-    c_files.append(rel[:-2] + ".o")
+    if "kernelsu-objs" in s or "kernelsu-y" in s:
+        part = s.split("=", 1)[1] if "=" in s else ""
+        for tok in part.replace("\\", " ").split():
+            if tok.endswith(".o") and tok not in objs:
+                objs.append(tok)
 
-objs = " \\\n\t".join(c_files)
-mk_content = f"""# Kbuild 4.4 compatible Makefile for BakaSU
+if not objs:
+    for p in sorted(ksu_dir.rglob("*.c")):
+        rel = p.relative_to(ksu_dir).as_posix()
+        if not any(x in rel.lower() for x in ("test", "example", "susfs")):
+            objs.append(rel[:-2] + ".o")
+
+obj_list = " \\\n\t".join(objs)
+mk = f"""# Kbuild 4.4 Makefile for BakaSU
 obj-$(CONFIG_KSU) += kernelsu.o
-kernelsu-objs := {objs}
+kernelsu-objs := {obj_list}
 
 ccflags-y += -I$(srctree)/drivers/kernelsu
 ccflags-y += -I$(srctree)/drivers/kernelsu/include
 ccflags-y += -I$(srctree)/KernelSU/kernel
 ccflags-y += -I$(srctree)/KernelSU/kernel/include
-ccflags-y += -DKSU_GIT_VERSION=12000
+ccflags-y += -I$(srctree)/KernelSU/uapi
+ccflags-y += -DKSU_GIT_VERSION=12000 -DKSU_VERSION=12000
+ccflags-y += -DEXPECTED_SIZE=0x033b -DEXPECTED_HASH=\\"0000000000000000000000000000000000000000000000000000000000000000\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
 """
-(ksu_dir / "Makefile").write_text(mk_content)
-print(f"[OK] Makefile Kbuild 4.4 dibuat dengan {len(c_files)} objek: {', '.join(c_files)}")
+makefile_f.write_text(mk)
+print("[OK] Kbuild dihapus, drivers/kernelsu/Makefile dibuat dengan objek:")
+print("    ", ", ".join(objs))
 EOF
 fi
 
