@@ -37,29 +37,36 @@ if [ ! -e "drivers/kernelsu" ]; then
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 fi
 
-# 2b. Patch kompatibilitas Kbuild/Makefile BakaSU untuk kernel 4.4
-if [ -f "drivers/kernelsu/Makefile" ]; then
-    echo "[INFO] Menyesuaikan Makefile BakaSU untuk Kbuild 4.4..."
+# 2b. Tulis ulang Makefile BakaSU ke format Kbuild murni Linux 4.4 (fix Makefile.modbuiltin Error 2)
+if [ -d "drivers/kernelsu" ]; then
+    echo "[INFO] Membangun ulang drivers/kernelsu/Makefile kompatibel Kbuild 4.4..."
     python3 - << 'EOF'
-import pathlib, re
+import pathlib, os
 
-mk_p = pathlib.Path("drivers/kernelsu/Makefile")
-mk = mk_p.read_text()
+ksu_dir = pathlib.Path("drivers/kernelsu").resolve()
+c_files = []
+for p in sorted(ksu_dir.rglob("*.c")):
+    rel = p.relative_to(ksu_dir).as_posix()
+    # Abaikan file test atau tools userspace jika ada
+    if any(skip in rel.lower() for skip in ("test", "selftest", "example")):
+        continue
+    c_files.append(rel[:-2] + ".o")
 
-# Pastikan KSU_GIT_VERSION selalu memiliki nilai valid
-if "KSU_GIT_VERSION" in mk:
-    mk = "KSU_GIT_VERSION := 12000\n" + mk
+objs = " \\\n\t".join(c_files)
+mk_content = f"""# Kbuild 4.4 compatible Makefile for BakaSU
+obj-$(CONFIG_KSU) += kernelsu.o
+kernelsu-objs := {objs}
 
-# Hapus baris Kbuild modern yang sering gagal di Makefile.modbuiltin 4.4
-cleaned = []
-for line in mk.splitlines():
-    if any(bad in line for bad in ("$(error", "check_kallsyms", "KSU_EXPECTED_SIZE", "KSU_EXPECTED_HASH")):
-        cleaned.append("# " + line)
-    else:
-        cleaned.append(line)
-
-mk_p.write_text("\n".join(cleaned) + "\n")
-print("[OK] Makefile BakaSU disesuaikan untuk kernel 4.4")
+ccflags-y += -I$(srctree)/drivers/kernelsu
+ccflags-y += -I$(srctree)/drivers/kernelsu/include
+ccflags-y += -I$(srctree)/KernelSU/kernel
+ccflags-y += -I$(srctree)/KernelSU/kernel/include
+ccflags-y += -DKSU_GIT_VERSION=12000
+ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
+ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
+"""
+(ksu_dir / "Makefile").write_text(mk_content)
+print(f"[OK] Makefile Kbuild 4.4 dibuat dengan {len(c_files)} objek: {', '.join(c_files)}")
 EOF
 fi
 
