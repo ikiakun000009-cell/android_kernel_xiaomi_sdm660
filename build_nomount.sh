@@ -117,11 +117,11 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + ekstrak sertifikat APK rilis + adapter 4.4 + versi 35300+
+# 6. Konversi Kbuild BakaSU + tanam sertifikat APK HP (0x377) + adapter 4.4 + versi 36000
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
-import hashlib, json, os, pathlib, re, struct, subprocess, urllib.request
+import os, pathlib, re, subprocess
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
@@ -270,90 +270,20 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Hitung KSU_VERSION >= 35300 agar menghilangkan banner 'Kernel update required'
+# Set KSU_VERSION = 36000 & sertifikat persis milik com.resukisu.resukisu di HP user
 def run_git(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
 
-git_count_str = run_git("git -C KernelSU rev-list --count HEAD")
-git_count = int(git_count_str) if git_count_str.isdigit() else 5500
-if git_count < 5300:
-    git_count = 5500
-
-ksu_ver = 30000 + git_count
-
+git_count = 6000
+ksu_ver = 36000
 ver_full = run_git("git -C KernelSU describe --tags --always")
 if not ver_full or not ver_full.startswith("v"):
-    m_vf = re.search(r'KSU_VERSION_FULL\s*:?=\s*\\?"?([^"\s\)]+)', raw)
-    ver_full = m_vf.group(1) if m_vf else f"v4.2.0-{git_count}"
+    ver_full = "v4.2.0-rc3"
 
-all_ksu_src = raw + "\n" + "\n".join(
-    p.read_text(errors="ignore") for p in ksu_dir.rglob("*") if p.suffix in (".c", ".h", ".mk")
-)
-m_sz = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?SIZE\s*(?::?=|=)\s*(0x[0-9a-fA-F]+|\d+)', all_ksu_src)
-exp_size = m_sz.group(1) if m_sz else "0x033b"
-
-m_hs = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?HASH\s*(?::?=|=)\s*\\?"?([0-9a-fA-F]{64})', all_ksu_src)
-exp_hash = m_hs.group(1) if m_hs else "0000000000000000000000000000000000000000000000000000000000000000"
-
-# Ekstrak langsung sertifikat v2/v3 dari APK Rilis resmi Baka-SU agar verifikasi root 100% cocok
-def extract_apk_v2_cert(apk_bytes):
-    eocd_pos = apk_bytes.rfind(b"\x50\x4b\x05\x06")
-    if eocd_pos < 24:
-        return None
-    cd_offset = struct.unpack("<I", apk_bytes[eocd_pos + 16:eocd_pos + 20])[0]
-    if cd_offset < 24 or apk_bytes[cd_offset - 16:cd_offset] != b"APK Sig Block 42":
-        return None
-    block_size = struct.unpack("<Q", apk_bytes[cd_offset - 24:cd_offset - 16])[0]
-    block_start = cd_offset - 8 - block_size
-    pos = block_start + 8
-    end = cd_offset - 24
-    while pos + 12 <= end:
-        pair_len, pair_id = struct.unpack("<QI", apk_bytes[pos:pos + 12])
-        val = apk_bytes[pos + 12:pos + 8 + pair_len]
-        if pair_id in (0x7109871a, 0xf05368c0) and len(val) >= 12:
-            signers_len = struct.unpack("<I", val[0:4])[0]
-            signer_len = struct.unpack("<I", val[4:8])[0]
-            signer = val[8:8 + signer_len]
-            signed_data_len = struct.unpack("<I", signer[0:4])[0]
-            signed_data = signer[4:4 + signed_data_len]
-            digests_len = struct.unpack("<I", signed_data[0:4])[0]
-            certs_off = 4 + digests_len
-            certs_len = struct.unpack("<I", signed_data[certs_off:certs_off + 4])[0]
-            first_cert_len = struct.unpack("<I", signed_data[certs_off + 4:certs_off + 8])[0]
-            cert_der = signed_data[certs_off + 8:certs_off + 8 + first_cert_len]
-            return hex(len(cert_der)), hashlib.sha256(cert_der).hexdigest()
-        pos += 8 + pair_len
-    return None
-
-try:
-    req = urllib.request.Request(
-        "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=5",
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        releases = json.loads(resp.read().decode())
-    apk_url = None
-    for rel in releases:
-        for asset in rel.get("assets", []):
-            name = asset.get("name", "")
-            if name.endswith("-release.apk") and ("arm64" in name or "universal" in name):
-                apk_url = asset["browser_download_url"]
-                break
-        if apk_url:
-            break
-    if apk_url:
-        print(f"[INFO] Mengunduh APK rilis untuk ekstrak sertifikat: {apk_url}")
-        with urllib.request.urlopen(apk_url, timeout=30) as aresp:
-            apk_data = aresp.read()
-        cert_info = extract_apk_v2_cert(apk_data)
-        if cert_info:
-            exp_size, exp_hash = cert_info
-            print(f"[OK] Sertifikat BakaSU Release terekstrak -> SIZE={exp_size}, HASH={exp_hash}")
-except Exception as e:
-    print(f"[WARN] Lewati auto-ekstrak APK rilis ({e}), memakai kunci bawaan.")
-
-print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Manager Size: {exp_size}")
+exp_size = "0x377"
+exp_hash = "d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64"
+print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Manager Cert SIZE={exp_size}, HASH={exp_hash}")
 
 # Buat compat/syscall_no.h
 sys_h = ksu_dir / "compat" / "syscall_no.h"
@@ -519,7 +449,7 @@ ccflags-y += -I$(objtree)/security/selinux/include
 ccflags-y += {active_defs}
 ccflags-y += -DKSU_GIT_VERSION={git_count} -DKSU_VERSION={ksu_ver} -DKSU_VERSION_FULL=\\"{ver_full}\\"
 ccflags-y += -DEXPECTED_SIZE={exp_size} -DEXPECTED_HASH=\\"{exp_hash}\\"
-ccflags-y += -DEXPECTED_PR_BUILD_SIZE=0x033b -DEXPECTED_PR_BUILD_HASH=\\"0000000000000000000000000000000000000000000000000000000000000000\\"
+ccflags-y += -DEXPECTED_PR_BUILD_SIZE={exp_size} -DEXPECTED_PR_BUILD_HASH=\\"{exp_hash}\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
 subdir-ccflags-y += $(ccflags-y)
@@ -527,7 +457,7 @@ subdir-ccflags-y += $(ccflags-y)
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
-# Pastikan KSU_VERSION tidak tertimpa 30000 & slot custom/PR key kosong tidak memicu error
+# Pastikan KSU_VERSION tidak tertimpa 30000 & sertifikat 0x377 aktif di apk_sign.c
 for hdr_or_c in ksu_dir.rglob("*"):
     if hdr_or_c.suffix in (".c", ".h"):
         htxt = hdr_or_c.read_text(errors="ignore")
@@ -538,14 +468,14 @@ for hdr_or_c in ksu_dir.rglob("*"):
             flags=re.M,
         )
         new_htxt = re.sub(
-            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?SIZE)\s*$',
-            r'\1 0x033b',
+            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?SIZE).*$',
+            rf'\1 {exp_size}',
             new_htxt,
             flags=re.M,
         )
         new_htxt = re.sub(
-            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?HASH)\s*$',
-            r'\1 "0000000000000000000000000000000000000000000000000000000000000000"',
+            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?HASH).*$',
+            rf'\1 "{exp_hash}"',
             new_htxt,
             flags=re.M,
         )
@@ -557,19 +487,18 @@ if apk_sign_f.exists():
     atxt = apk_sign_f.read_text(errors="ignore")
     atxt = re.sub(
         r'^\s*\{\s*EXPECTED_PR_BUILD_SIZE\s*,\s*EXPECTED_PR_BUILD_HASH\s*\}\s*,?.*$',
-        '/* [4.4-compat] PR build slot skipped */',
+        f'    {{ {exp_size}, "{exp_hash}" }},',
         atxt,
         flags=re.M,
     )
-    if exp_hash == "0000000000000000000000000000000000000000000000000000000000000000":
-        atxt = re.sub(
-            r'^\s*\{\s*EXPECTED_SIZE\s*,\s*EXPECTED_HASH\s*\}\s*,?.*$',
-            '/* [4.4-compat] Custom slot skipped (using built-in BakaSU keys) */',
-            atxt,
-            flags=re.M,
-        )
+    atxt = re.sub(
+        r'^\s*\{\s*EXPECTED_SIZE\s*,\s*EXPECTED_HASH\s*\}\s*,?.*$',
+        f'    {{ {exp_size}, "{exp_hash}" }},',
+        atxt,
+        flags=re.M,
+    )
     apk_sign_f.write_text(atxt)
-    print("[OK] apk_sign.c disesuaikan (kunci sertifikat BakaSU aktif)")
+    print(f"[OK] apk_sign.c diperbarui dengan sertifikat HP ({exp_size})")
 
 # Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
 lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
