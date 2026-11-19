@@ -2,10 +2,41 @@
 #include <linux/init.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+static void replace_cmdline_flag(char *buf, const char *key, const char *val)
+{
+	char *p = strstr(buf, key);
+	size_t klen = strlen(key);
+	size_t vlen = strlen(val);
+
+	if (!p)
+		return;
+	p += klen;
+	while (*p && *p != ' ' && vlen > 0) {
+		*p++ = *val++;
+		vlen--;
+	}
+	while (*p && *p != ' ')
+		*p++ = ' ';
+}
 
 static int cmdline_proc_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "%s\n", saved_command_line);
+	char *clean_cmd = kstrdup(saved_command_line, GFP_KERNEL);
+
+	if (!clean_cmd) {
+		seq_printf(m, "%s\n", saved_command_line);
+		return 0;
+	}
+
+	replace_cmdline_flag(clean_cmd, "androidboot.verifiedbootstate=", "green ");
+	replace_cmdline_flag(clean_cmd, "androidboot.flash.locked=", "1");
+	replace_cmdline_flag(clean_cmd, "androidboot.vbmeta.device_state=", "locked  ");
+
+	seq_printf(m, "%s\n", clean_cmd);
+	kfree(clean_cmd);
 	return 0;
 }
 
