@@ -487,10 +487,15 @@ for hdr_or_c in ksu_dir.rglob("*"):
 
 apk_sign_f = ksu_dir / "manager" / "apk_sign.c"
 if apk_sign_f.exists():
-    atxt = apk_sign_f.read_text(errors="ignore")
-    atxt = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?SIZE(?:_[A-Z0-9_]+)?\b', exp_size, atxt)
-    atxt = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?HASH(?:_[A-Z0-9_]+)?\b', f'"{exp_hash}"', atxt)
-    apk_sign_f.write_text(atxt)
+    fixed_lines = []
+    for line in apk_sign_f.read_text(errors="ignore").splitlines():
+        if re.match(r'^\s*#\s*(?:ifdef|ifndef|if|elif|define|undef)\b', line):
+            fixed_lines.append(line)
+        else:
+            line = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?SIZE(?:_[A-Z0-9_]+)?\b', exp_size, line)
+            line = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?HASH(?:_[A-Z0-9_]+)?\b', f'"{exp_hash}"', line)
+            fixed_lines.append(line)
+    apk_sign_f.write_text("\n".join(fixed_lines) + "\n")
     print(f"[OK] apk_sign.c diperbarui dengan sertifikat HP ({exp_size})")
 
 # Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
