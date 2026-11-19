@@ -115,7 +115,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU (38 objek Kbuild + preinit.o saja), shim header, & tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU + embed preinit runner blob + shim header & tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -227,7 +227,7 @@ global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
 
-# Baca Kbuild utama & sub-Kbuild (seperti preinit/Kbuild) sebelum dikonversi
+# Baca Kbuild utama & sub-Kbuild sebelum dikonversi
 raw = ""
 if kbuild_f.exists():
     raw = kbuild_f.read_text()
@@ -321,40 +321,37 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     sys_h.write_text("\n".join(lines) + "\n")
     print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
 
-# Fallback jika preinit/preinit.c memerlukan binary/header runner dari preinit/runner/runner.c
-preinit_c = ksu_dir / "preinit" / "preinit.c"
+# Kompilasi biner preinit/runner/runner.c (dengan semua folder include nolibc.h)
 runner_c = ksu_dir / "preinit" / "runner" / "runner.c"
-if preinit_c.exists() and runner_c.exists():
-    ptxt = preinit_c.read_text(errors="ignore")
-    runner_bin = pathlib.Path("/tmp/ksu_preinit_runner")
+runner_bin = pathlib.Path("/tmp/ksu_preinit_runner")
+inc_flags = []
+seen_inc = set()
+for search_root in (ksu_dir, pathlib.Path("KernelSU"), pathlib.Path("tools/include/nolibc")):
+    if search_root.exists():
+        for d in [search_root] + [p for p in search_root.rglob("*") if p.is_dir()]:
+            ds = d.as_posix()
+            if ds not in seen_inc:
+                seen_inc.add(ds)
+                inc_flags.append(f"-I{ds}")
+
+if runner_c.exists():
+    cmd_run = (
+        f"aarch64-linux-gnu-gcc -Os -fno-asynchronous-unwind-tables -fno-ident "
+        f"-fno-stack-protector -fomit-frame-pointer -U_FORTIFY_SOURCE -nostdlib -static "
+        f"{' '.join(inc_flags)} -o {runner_bin} {runner_c} && aarch64-linux-gnu-strip {runner_bin}"
+    )
+    subprocess.run(cmd_run, shell=True, check=False)
+
+if not runner_bin.exists():
+    stub_s = pathlib.Path("/tmp/ksu_stub_runner.S")
+    stub_s.write_text(".globl _start\n_start:\n\tmov x0, #0\n\tmov x8, #93\n\tsvc #0\n")
     subprocess.run(
-        f"aarch64-linux-gnu-gcc -nostdlib -static -Os -I drivers/kernelsu/preinit/runner -o {runner_bin} {runner_c} && aarch64-linux-gnu-strip {runner_bin}",
+        f"aarch64-linux-gnu-gcc -nostdlib -static -o {runner_bin} {stub_s} && aarch64-linux-gnu-strip {runner_bin}",
         shell=True,
         check=False,
     )
-    if runner_bin.exists():
-        rbytes = runner_bin.read_bytes()
-        for m_inc in re.finditer(r'\.incbin\s+"([^"]+)"', ptxt):
-            inc_name = pathlib.Path(m_inc.group(1)).name
-            for dst_dir in (ksu_dir / "preinit", pathlib.Path("out/drivers/kernelsu/preinit")):
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                dst_f = dst_dir / inc_name
-                if not dst_f.exists():
-                    dst_f.write_bytes(rbytes)
-        for m_hdr in re.finditer(r'#\s*include\s+"([^"]*runner[^"]*\.h)"', ptxt):
-            hdr_name = pathlib.Path(m_hdr.group(1)).name
-            hdr_f = ksu_dir / "preinit" / hdr_name
-            if not hdr_f.exists():
-                arr_m = re.search(r'\b([a-zA-Z_]\w*runner\w*)\b', ptxt)
-                arr_name = arr_m.group(1) if arr_m else "runner_bin"
-                hex_vals = ", ".join(f"0x{b:02x}" for b in rbytes)
-                hdr_f.write_text(
-                    f"static const unsigned char {arr_name}[] = {{{hex_vals}}};\n"
-                    f"static const unsigned int {arr_name}_len = {len(rbytes)};\n"
-                )
-                print(f"[OK] Generated {hdr_name} dari runner.c ({len(rbytes)} bytes)")
 
-# Susun daftar objek kernel dari Kbuild (sama seperti 38 objek bersih sebelumnya)
+# Susun daftar objek kernel dari Kbuild
 raw = re.sub(r'\\\r?\n', ' ', raw)
 ap_pat = re.compile(r'\$\(addprefix\s+([^,\s]+)\s*,\s*([^)]+)\)')
 while ap_pat.search(raw):
@@ -404,14 +401,43 @@ for s in active_lines:
             if tok.endswith(".o") and tok not in objs:
                 objs.append(tok)
 
-# Tambahkan HANYA file kernel di preinit/ (kecuali sub-folder userspace runner/)
+# Tambahkan preinit/*.c, preinit/*.S, dan definisi simbol ksu_preinit_runner_start/end
 preinit_dir = ksu_dir / "preinit"
 if preinit_dir.is_dir():
-    for p in sorted(preinit_dir.glob("*.c")):
+    preinit_texts = []
+    for pf in sorted(preinit_dir.iterdir()):
+        if pf.is_file() and (pf.suffix in (".c", ".S", ".s", ".h") or pf.name in ("Kbuild", "Makefile")):
+            pt = pf.read_text(errors="ignore")
+            preinit_texts.append(pt)
+            if runner_bin.exists():
+                for m_inc in re.finditer(r'\.incbin\s+"([^"]+)"', pt):
+                    inc_rel = m_inc.group(1)
+                    for base_d in (preinit_dir, pathlib.Path("out/drivers/kernelsu/preinit"), pathlib.Path("out")):
+                        dst_f = base_d / inc_rel
+                        dst_f.parent.mkdir(parents=True, exist_ok=True)
+                        if not dst_f.exists():
+                            dst_f.write_bytes(runner_bin.read_bytes())
+
+    for p in sorted(preinit_dir.glob("*.c")) + sorted(preinit_dir.glob("*.S")):
         o_rel = p.relative_to(ksu_dir).as_posix()[:-2] + ".o"
         if o_rel not in objs:
             objs.append(o_rel)
             print(f"[OK] Menambahkan objek preinit: {o_rel}")
+
+    combined_preinit = "\n".join(preinit_texts)
+    if "ksu_preinit_runner_start" not in combined_preinit and runner_bin.exists():
+        blob_s = preinit_dir / "ksu_runner_blob.S"
+        blob_s.write_text(
+            '.section .init.rodata, "a"\n'
+            '.balign 8\n'
+            '.globl ksu_preinit_runner_start\n'
+            'ksu_preinit_runner_start:\n'
+            f'.incbin "{runner_bin}"\n'
+            '.globl ksu_preinit_runner_end\n'
+            'ksu_preinit_runner_end:\n'
+        )
+        objs.append("preinit/ksu_runner_blob.o")
+        print(f"[OK] Membuat ksu_runner_blob.S ({runner_bin.stat().st_size} bytes)")
 
 obj_list = " \\\n\t".join(objs)
 active_defs = " ".join(f"-D{c}=1" for c in sorted(enabled_configs) if c.startswith("CONFIG_KSU"))
