@@ -115,7 +115,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU (ekspansi addprefix + auto-link preinit.o), shim header, & tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU (38 objek Kbuild + preinit.o saja), shim header, & tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -125,7 +125,7 @@ ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
 
-# Baca seluruh simbol aktif dari out/.config
+# Baca simbol aktif dari out/.config
 enabled_configs = set(["CONFIG_KSU", "CONFIG_ARM64", "CONFIG_KSU_MANUAL_HOOK", "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
 dot_cfg = pathlib.Path("out/.config")
 if dot_cfg.exists():
@@ -227,7 +227,7 @@ global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
 
-# Baca Kbuild BakaSU sebelum dikonversi ke Makefile 4.4
+# Baca Kbuild utama & sub-Kbuild (seperti preinit/Kbuild) sebelum dikonversi
 raw = ""
 if kbuild_f.exists():
     raw = kbuild_f.read_text()
@@ -235,67 +235,62 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-raw = re.sub(r'\\\r?\n', ' ', raw)
+sub_raws = []
+for sub_kb in sorted(ksu_dir.glob("*/Kbuild")) + sorted(ksu_dir.glob("*/Makefile")):
+    sub_dir_rel = sub_kb.parent.relative_to(ksu_dir).as_posix()
+    sub_raws.append((sub_dir_rel, sub_kb.read_text()))
 
-# Ekspansi fungsi GNU Make $(addprefix ...) dan $(wildcard ...) di Kbuild
-ap_pat = re.compile(r'\$\(addprefix\s+([^,\s]+)\s*,\s*([^)]+)\)')
-while ap_pat.search(raw):
-    raw = ap_pat.sub(lambda m: " ".join(m.group(1) + item for item in m.group(2).split()), raw)
+def run_kbuild_generators(kb_text, rel_sub=""):
+    kb_text = re.sub(r'\\\r?\n', ' ', kb_text)
+    base_src = f"drivers/kernelsu/{rel_sub}".rstrip("/")
+    cmds = {}
+    for m in re.finditer(r'^\s*cmd_([A-Za-z0-9_]+)\s*:?=\s*(.+)$', kb_text, re.M):
+        cmds[m.group(1)] = m.group(2).strip()
 
-wc_pat = re.compile(r'\$\(wildcard\s+([^)]+)\)')
-raw = wc_pat.sub(
-    lambda m: " ".join(
-        sorted(
-            p.relative_to(ksu_dir).as_posix()
-            for p in ksu_dir.glob(m.group(1).strip().replace("$(src)/", "").replace("$(obj)/", ""))
-        )
-    ),
-    raw,
-)
-
-# Jalankan aturan generator header (.h) dari Kbuild (seperti compat/syscall_no.h)
-cmds = {}
-for m in re.finditer(r'^\s*cmd_([A-Za-z0-9_]+)\s*:?=\s*(.+)$', raw, re.M):
-    cmds[m.group(1)] = m.group(2).strip()
-
-for m in re.finditer(r'^\s*([^\s:#]+\.h)\s*:\s*([^\n]+)', raw, re.M):
-    target_raw = m.group(1).strip()
-    deps_raw = m.group(2).strip()
-    pos = m.end()
-    recipe_lines = []
-    for rline in raw[pos:].splitlines():
-        if not rline.strip():
+    for m in re.finditer(r'^\s*([^\s:#=]+)\s*:\s*([^\n]+)', kb_text, re.M):
+        target_raw = m.group(1).strip()
+        deps_raw = m.group(2).strip()
+        if target_raw.endswith(".o") or target_raw.startswith("."):
             continue
-        if rline.startswith(("\t", " ")) and not rline.lstrip().startswith("#"):
-            recipe_lines.append(rline.strip())
-        else:
-            break
-    if not recipe_lines:
-        continue
+        pos = m.end()
+        recipe_lines = []
+        for rline in kb_text[pos:].splitlines():
+            if not rline.strip():
+                continue
+            if rline.startswith(("\t", " ")) and not rline.lstrip().startswith("#"):
+                recipe_lines.append(rline.strip())
+            else:
+                break
+        if not recipe_lines:
+            continue
 
-    def expand_vars(s, tgt, deps):
-        first_dep = deps.split()[0] if deps.split() else ""
-        s = s.replace("$@", tgt).replace("$<", first_dep).replace("$^", deps)
-        s = s.replace("$(srctree)", ".").replace("$(objtree)", ".")
-        s = s.replace("$(src)", "drivers/kernelsu").replace("$(obj)", "drivers/kernelsu")
-        s = s.replace("$(SRCARCH)", "arm64").replace("$(ARCH)", "arm64")
-        s = s.replace("$(CC)", "clang").replace("$(CPP)", "clang -E")
-        s = s.replace("$(HOSTCC)", "gcc").replace("$(AWK)", "awk")
-        s = s.replace("$(SED)", "sed").replace("$(PERL)", "perl")
-        s = s.replace("$(PYTHON3)", "python3").replace("$(PYTHON)", "python3")
-        return s
+        def expand_vars(s, tgt, deps):
+            first_dep = deps.split()[0] if deps.split() else ""
+            s = s.replace("$@", tgt).replace("$<", first_dep).replace("$^", deps)
+            s = s.replace("$(srctree)", ".").replace("$(objtree)", ".")
+            s = s.replace("$(src)", base_src).replace("$(obj)", base_src)
+            s = s.replace("$(SRCARCH)", "arm64").replace("$(ARCH)", "arm64")
+            s = s.replace("$(CC)", "clang").replace("$(CPP)", "clang -E")
+            s = s.replace("$(HOSTCC)", "gcc").replace("$(AWK)", "awk")
+            s = s.replace("$(SED)", "sed").replace("$(PERL)", "perl")
+            s = s.replace("$(PYTHON3)", "python3").replace("$(PYTHON)", "python3")
+            return s
 
-    tgt_path = expand_vars(target_raw, "", "")
-    deps_exp = expand_vars(deps_raw, tgt_path, "")
-    pathlib.Path(tgt_path).parent.mkdir(parents=True, exist_ok=True)
+        tgt_path = expand_vars(target_raw, "", "")
+        deps_exp = expand_vars(deps_raw, tgt_path, "")
+        pathlib.Path(tgt_path).parent.mkdir(parents=True, exist_ok=True)
 
-    for r in recipe_lines:
-        cm = re.match(r'^\$\(call\s+(?:if_changed(?:_dep|_rule)?,)?cmd,([A-Za-z0-9_]+)\)', r)
-        if cm and cm.group(1) in cmds:
-            cmd_str = expand_vars(cmds[cm.group(1)], tgt_path, deps_exp)
-        else:
-            cmd_str = expand_vars(r.lstrip("@- "), tgt_path, deps_exp)
-        subprocess.run(cmd_str, shell=True, check=False)
+        for r in recipe_lines:
+            cm = re.match(r'^\$\(call\s+(?:if_changed(?:_dep|_rule)?,)?cmd,([A-Za-z0-9_]+)\)', r)
+            if cm and cm.group(1) in cmds:
+                cmd_str = expand_vars(cmds[cm.group(1)], tgt_path, deps_exp)
+            else:
+                cmd_str = expand_vars(r.lstrip("@- "), tgt_path, deps_exp)
+            subprocess.run(cmd_str, shell=True, check=False)
+
+run_kbuild_generators(raw)
+for sub_rel, s_txt in sub_raws:
+    run_kbuild_generators(s_txt, sub_rel)
 
 # Fallback jika compat/syscall_no.h belum terbuat atau kosong
 sys_h = ksu_dir / "compat" / "syscall_no.h"
@@ -326,7 +321,45 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     sys_h.write_text("\n".join(lines) + "\n")
     print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
 
-# Evaluasi blok kondisional Kbuild terhadap out/.config
+# Fallback jika preinit/preinit.c memerlukan binary/header runner dari preinit/runner/runner.c
+preinit_c = ksu_dir / "preinit" / "preinit.c"
+runner_c = ksu_dir / "preinit" / "runner" / "runner.c"
+if preinit_c.exists() and runner_c.exists():
+    ptxt = preinit_c.read_text(errors="ignore")
+    runner_bin = pathlib.Path("/tmp/ksu_preinit_runner")
+    subprocess.run(
+        f"aarch64-linux-gnu-gcc -nostdlib -static -Os -I drivers/kernelsu/preinit/runner -o {runner_bin} {runner_c} && aarch64-linux-gnu-strip {runner_bin}",
+        shell=True,
+        check=False,
+    )
+    if runner_bin.exists():
+        rbytes = runner_bin.read_bytes()
+        for m_inc in re.finditer(r'\.incbin\s+"([^"]+)"', ptxt):
+            inc_name = pathlib.Path(m_inc.group(1)).name
+            for dst_dir in (ksu_dir / "preinit", pathlib.Path("out/drivers/kernelsu/preinit")):
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                dst_f = dst_dir / inc_name
+                if not dst_f.exists():
+                    dst_f.write_bytes(rbytes)
+        for m_hdr in re.finditer(r'#\s*include\s+"([^"]*runner[^"]*\.h)"', ptxt):
+            hdr_name = pathlib.Path(m_hdr.group(1)).name
+            hdr_f = ksu_dir / "preinit" / hdr_name
+            if not hdr_f.exists():
+                arr_m = re.search(r'\b([a-zA-Z_]\w*runner\w*)\b', ptxt)
+                arr_name = arr_m.group(1) if arr_m else "runner_bin"
+                hex_vals = ", ".join(f"0x{b:02x}" for b in rbytes)
+                hdr_f.write_text(
+                    f"static const unsigned char {arr_name}[] = {{{hex_vals}}};\n"
+                    f"static const unsigned int {arr_name}_len = {len(rbytes)};\n"
+                )
+                print(f"[OK] Generated {hdr_name} dari runner.c ({len(rbytes)} bytes)")
+
+# Susun daftar objek kernel dari Kbuild (sama seperti 38 objek bersih sebelumnya)
+raw = re.sub(r'\\\r?\n', ' ', raw)
+ap_pat = re.compile(r'\$\(addprefix\s+([^,\s]+)\s*,\s*([^)]+)\)')
+while ap_pat.search(raw):
+    raw = ap_pat.sub(lambda m: " ".join(m.group(1) + item for item in m.group(2).split()), raw)
+
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -336,18 +369,14 @@ for line in raw.splitlines():
     if s.startswith(("ifeq ", "ifneq ", "ifdef ", "ifndef ")):
         low = s.lower()
         is_neg = s.startswith(("ifneq ", "ifndef "))
-        if re.search(r',\s*\)', s):
-            is_neg = not is_neg
-        cond_cfgs = re.findall(r'CONFIG_[A-Z0-9_]+', s)
         if any(k in low for k in ("susfs", "lkm", "tracepoint", "kprobes", "syscall_hook", "inline_hook")):
             skip_stack.append(not is_neg)
+        elif "manual" in low and "hook" in low:
+            skip_stack.append(is_neg)
         elif any(k in low for k in ("config_arm64", "aarch64")):
             skip_stack.append(is_neg)
         elif any(k in low for k in ("config_arm", "config_x86", "config_riscv", "arm32", "x86_64", "riscv")):
             skip_stack.append(not is_neg)
-        elif cond_cfgs:
-            is_set = all(c in enabled_configs for c in cond_cfgs)
-            skip_stack.append((not is_set) if not is_neg else is_set)
         else:
             skip_stack.append(False)
         continue
@@ -364,70 +393,25 @@ for line in raw.splitlines():
 
 objs = []
 for s in active_lines:
-    m_lhs = re.match(
-        r'^(kernelsu-objs|kernelsu-y|kernelsu-\$\((CONFIG_[A-Z0-9_]+)\)|obj-\$\((CONFIG_[A-Z0-9_]+)\))\s*[:+]?=\s*(.+)$',
-        s
-    )
-    if not m_lhs:
-        continue
-    cfg_cond = m_lhs.group(2) or m_lhs.group(3)
-    if cfg_cond and cfg_cond not in enabled_configs:
-        continue
-    for tok in m_lhs.group(4).split():
-        tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
-        if tok == "kernelsu.o":
-            continue
-        if any(arch in tok.lower() for arch in ("x86", "arm32", "riscv", "hook/arm/")):
-            continue
-        if tok.endswith(".o"):
-            if tok not in objs:
-                objs.append(tok)
-        elif tok.endswith("/"):
-            sub = ksu_dir / tok.rstrip("/")
-            if sub.is_dir():
-                for p in sorted(sub.rglob("*.c")):
-                    rel = p.relative_to(ksu_dir).as_posix()
-                    o_rel = rel[:-2] + ".o"
-                    if o_rel not in objs:
-                        objs.append(o_rel)
-
-# Pastikan seluruh file .c arm64 BakaSU (termasuk preinit.c) ikut terkompilasi
-excluded_kw = ("test", "example", "susfs", "lkm", "tracepoint", "kprobes",
-               "syscall_hook", "inline_hook", "x86", "arm32", "riscv", "hook/arm/")
-for p in sorted(ksu_dir.rglob("*.c")):
-    rel = p.relative_to(ksu_dir).as_posix()
-    if any(k in rel.lower() for k in excluded_kw):
-        continue
-    o_rel = rel[:-2] + ".o"
-    if o_rel not in objs:
-        objs.append(o_rel)
-
-# Resolusi transitif simbol ksu_*: pastikan setiap fungsi ksu_* yang dipanggil punya definisi di objs
-sym_def_map = {}
-for p in sorted(ksu_dir.rglob("*.c")):
-    rel = p.relative_to(ksu_dir).as_posix()
-    if any(k in rel.lower() for k in ("test", "example", "x86", "arm32", "riscv", "hook/arm/")):
-        continue
-    ctxt = p.read_text(errors="ignore")
-    for m in re.finditer(r'^(?:[a-zA-Z_][\w\s\*]+?)\b(ksu_[a-zA-Z0-9_]+)\s*\(', ctxt, re.M):
-        sym_def_map.setdefault(m.group(1), []).append(rel[:-2] + ".o")
-
-changed = True
-while changed:
-    changed = False
-    used_syms = set()
-    for o_rel in objs:
-        c_p = ksu_dir / (o_rel[:-2] + ".c")
-        if c_p.exists():
-            used_syms.update(re.findall(r'\bksu_[a-zA-Z0-9_]+\b', c_p.read_text(errors="ignore")))
-    for sym in sorted(used_syms):
-        for cand_o in sym_def_map.get(sym, []):
-            if any(k in cand_o.lower() for k in excluded_kw):
+    if re.match(r'^(kernelsu-objs|kernelsu-y|kernelsu-\$\(CONFIG_[A-Z0-9_]+\)|obj-\$\(CONFIG_[A-Z0-9_]+\))\s*[:+]?=', s):
+        part = s.split("=", 1)[1]
+        for tok in part.split():
+            tok = tok.replace("$(src)/", "").replace("$(obj)/", "")
+            if tok == "kernelsu.o":
                 continue
-            if cand_o not in objs:
-                objs.append(cand_o)
-                print(f"[OK] Auto-linked {cand_o} (untuk simbol {sym})")
-                changed = True
+            if any(arch in tok.lower() for arch in ("x86", "arm32", "riscv", "hook/arm/", "tools/", "runner/")):
+                continue
+            if tok.endswith(".o") and tok not in objs:
+                objs.append(tok)
+
+# Tambahkan HANYA file kernel di preinit/ (kecuali sub-folder userspace runner/)
+preinit_dir = ksu_dir / "preinit"
+if preinit_dir.is_dir():
+    for p in sorted(preinit_dir.glob("*.c")):
+        o_rel = p.relative_to(ksu_dir).as_posix()[:-2] + ".o"
+        if o_rel not in objs:
+            objs.append(o_rel)
+            print(f"[OK] Menambahkan objek preinit: {o_rel}")
 
 obj_list = " \\\n\t".join(objs)
 active_defs = " ".join(f"-D{c}=1" for c in sorted(enabled_configs) if c.startswith("CONFIG_KSU"))
@@ -446,11 +430,13 @@ ccflags-y += -I$(srctree)/drivers/kernelsu/hook/arm64
 ccflags-y += -I$(srctree)/drivers/kernelsu/infra
 ccflags-y += -I$(srctree)/drivers/kernelsu/manager
 ccflags-y += -I$(srctree)/drivers/kernelsu/policy
+ccflags-y += -I$(srctree)/drivers/kernelsu/preinit
 ccflags-y += -I$(srctree)/drivers/kernelsu/runtime
 ccflags-y += -I$(srctree)/drivers/kernelsu/selinux
 ccflags-y += -I$(srctree)/drivers/kernelsu/supercall
 ccflags-y += -I$(srctree)/drivers/kernelsu/uapi
 ccflags-y += -I$(objtree)/drivers/kernelsu
+ccflags-y += -I$(objtree)/drivers/kernelsu/preinit
 ccflags-y += -I$(srctree)/KernelSU/kernel
 ccflags-y += -I$(srctree)/KernelSU/kernel/include
 ccflags-y += -I$(srctree)/KernelSU/uapi
@@ -466,7 +452,7 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-v
 subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
-print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek):", ", ".join(o for o in objs if "preinit" in o) or "cek objek")
+print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
 # Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
 lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
