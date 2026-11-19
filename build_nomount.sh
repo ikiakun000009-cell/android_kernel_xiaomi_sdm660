@@ -44,19 +44,20 @@ if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ 
     curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
 fi
 
-# 4. Atur Kconfig BakaSU (Manual Hook + Auto Setuid) & NoMount di defconfig
+# 4. Atur Kconfig BakaSU (Full Manual Hook 6-titik) & NoMount di defconfig
 python3 - << 'EOF' "$DEFCONFIG_PATH"
 import pathlib, re, sys
 
 defcfg_p = pathlib.Path(sys.argv[1])
 ksu_dir = pathlib.Path("drivers/kernelsu")
 
-manual_syms = set(["KSU_MANUAL_HOOK", "KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
+manual_syms = set(["KSU_MANUAL_HOOK"])
 disable_syms = set([
     "KSU_WITH_KPROBES",
     "KSU_TRACEPOINT_HOOK",
     "KSU_SUSFS",
     "KSU_LKM",
+    "KSU_MANUAL_HOOK_AUTO_SETUID_HOOK",
     "KSU_MANUAL_HOOK_AUTO_INITRC_HOOK",
     "KSU_MANUAL_HOOK_AUTO_INPUT_HOOK",
 ])
@@ -92,7 +93,8 @@ for cfg in \
     CONFIG_KSU=y \
     CONFIG_KALLSYMS=y \
     CONFIG_KALLSYMS_ALL=y \
-    CONFIG_OVERLAY_FS=y; do
+    CONFIG_OVERLAY_FS=y \
+    CONFIG_CRYPTO_SHA256=y; do
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
@@ -115,7 +117,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + patch apk_sign.c & versi + tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU + adapter kernel_read/write 4.4 + versi 35300+ + tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -126,15 +128,16 @@ kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
 
 # Baca simbol aktif dari out/.config
-enabled_configs = set(["CONFIG_KSU", "CONFIG_ARM64", "CONFIG_KSU_MANUAL_HOOK", "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK"])
+enabled_configs = set(["CONFIG_KSU", "CONFIG_ARM64", "CONFIG_KSU_MANUAL_HOOK"])
 dot_cfg = pathlib.Path("out/.config")
 if dot_cfg.exists():
     for line in dot_cfg.read_text(errors="ignore").splitlines():
         m_cfg = re.match(r'^(CONFIG_[A-Z0-9_]+)=y$', line.strip())
         if m_cfg:
             enabled_configs.add(m_cfg.group(1))
-for dis in ("CONFIG_KSU_WITH_KPROBES", "CONFIG_KSU_TRACEPOINT_HOOK", "CONFIG_KSU_SUSFS",
-            "CONFIG_KSU_LKM", "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK", "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK"):
+for dis in ("CONFIG_KSU_WITH_KPROBES", "CONFIG_KSU_TRACEPOINT_HOOK", "CONFIG_KSU_SUSFS", "CONFIG_KSU_LKM",
+            "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK", "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK",
+            "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK"):
     enabled_configs.discard(dis)
 
 # Pindai seluruh header include/linux/*.h untuk mencegah redefinition
@@ -175,12 +178,14 @@ for rel_h, body in shims.items():
         guard = "_KSU_SHIM_" + re.sub(r'[^A-Za-z0-9]', '_', rel_h).upper()
         dst.write_text(f"#ifndef {guard}\n#define {guard}\n{body}#endif\n")
 
-# Buat ksu_44_shim.h untuk fungsi/tipe pasca-4.4 yang belum ada di kernel 4.4.302
+# Buat ksu_44_shim.h termasuk adapter kernel_read() & kernel_write() untuk Linux < 4.14
 shim_lines = [
     "#ifndef _KSU_44_GLOBAL_SHIM_H",
     "#define _KSU_44_GLOBAL_SHIM_H",
+    "#ifndef __ASSEMBLY__",
     "#include <linux/version.h>",
     "#include <linux/types.h>",
+    "#include <linux/fs.h>",
     "#include <linux/slab.h>",
     "#include <linux/vmalloc.h>",
     "#include <linux/mm.h>",
@@ -188,6 +193,26 @@ shim_lines = [
     "#include <linux/string.h>",
     "#include <linux/ktime.h>",
     "#include <linux/compat.h>",
+    "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)",
+    "static inline ssize_t ksu_44_kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)",
+    "{",
+    "    loff_t offset = pos ? *pos : 0;",
+    "    ssize_t ret = kernel_read(file, offset, (char *)buf, count);",
+    "    if (pos && ret > 0)",
+    "        *pos = offset + ret;",
+    "    return ret;",
+    "}",
+    "static inline ssize_t ksu_44_kernel_write(struct file *file, const void *buf, size_t count, loff_t *pos)",
+    "{",
+    "    loff_t offset = pos ? *pos : 0;",
+    "    ssize_t ret = kernel_write(file, (const char *)buf, count, offset);",
+    "    if (pos && ret > 0)",
+    "        *pos = offset + ret;",
+    "    return ret;",
+    "}",
+    "#define kernel_read(file, buf, count, pos) ksu_44_kernel_read((file), (buf), (count), (pos))",
+    "#define kernel_write(file, buf, count, pos) ksu_44_kernel_write((file), (buf), (count), (pos))",
+    "#endif",
     "#ifndef in_compat_syscall",
     "#define in_compat_syscall() is_compat_task()",
     "#endif",
@@ -222,7 +247,7 @@ if not pathlib.Path("include/linux/refcount.h").exists():
         "static inline void refcount_inc(refcount_t *r) { atomic_inc(&r->refs); }",
         "static inline bool refcount_dec_and_test(refcount_t *r) { return atomic_dec_and_test(&r->refs); }",
     ])
-shim_lines.append("#endif")
+shim_lines.extend(["#endif", "#endif"])
 global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
@@ -235,32 +260,22 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Ekstrak versi kernel BakaSU serta EXPECTED_SIZE & EXPECTED_HASH jika ada
+# Hitung KSU_VERSION >= 35300 agar selalu kompatibel dengan Manager v4.2.0-rc3_35262+
 def run_git(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 git_count_str = run_git("git -C KernelSU rev-list --count HEAD")
-git_count = int(git_count_str) if git_count_str.isdigit() and int(git_count_str) > 1 else 25000
+git_count = int(git_count_str) if git_count_str.isdigit() else 5500
+if git_count < 5300:
+    git_count = 5500
 
-ksu_ver = None
-m_ver_expr = re.search(r'KSU_VERSION\s*:?=\s*\$\(shell\s+expr\s+([^\)]+)\)', raw)
-if m_ver_expr:
-    expr_s = m_ver_expr.group(1).replace("$(KSU_GIT_VERSION)", str(git_count))
-    nums = [int(x) for x in re.findall(r'\b\d+\b', expr_s)]
-    if nums and "+" in expr_s:
-        ksu_ver = sum(nums)
-if not ksu_ver:
-    m_ver_lit = re.search(r'KSU_VERSION\s*:?=\s*(\d+)', raw)
-    if m_ver_lit:
-        ksu_ver = int(m_ver_lit.group(1))
-if not ksu_ver or ksu_ver < 30000:
-    ksu_ver = 30000 + git_count
+ksu_ver = 30000 + git_count
 
 ver_full = run_git("git -C KernelSU describe --tags --always")
 if not ver_full or not ver_full.startswith("v"):
     m_vf = re.search(r'KSU_VERSION_FULL\s*:?=\s*\\?"?([^"\s\)]+)', raw)
-    ver_full = m_vf.group(1) if m_vf else f"v3.0.0-{git_count}"
+    ver_full = m_vf.group(1) if m_vf else f"v4.2.0-{git_count}"
 
 all_ksu_src = raw + "\n" + "\n".join(
     p.read_text(errors="ignore") for p in ksu_dir.rglob("*") if p.suffix in (".c", ".h", ".mk")
@@ -445,7 +460,7 @@ subdir-ccflags-y += $(ccflags-y)
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
-# Bersihkan slot custom/PR key kosong di apk_sign.c agar tidak memicu 'expected expression'
+# Bersihkan slot custom/PR key kosong di apk_sign.c agar built-in BakaSU release key aktif
 for hdr_or_c in ksu_dir.rglob("*"):
     if hdr_or_c.suffix in (".c", ".h"):
         htxt = hdr_or_c.read_text(errors="ignore")
@@ -587,8 +602,8 @@ if kc_path.exists():
 EOF
 fi
 
-# 7. Terapkan Manual Hooks BakaSU secara aman (cek simbol yang tersedia di drivers/kernelsu)
-echo "[INFO] Memasang manual hooks pada fs/ dan drivers/input/..."
+# 7. Terapkan 6 Manual Hooks BakaSU (termasuk setresuid di kernel/sys.c untuk eskalasi root)
+echo "[INFO] Memasang manual hooks pada fs/, drivers/input/, dan kernel/sys.c..."
 python3 - << 'EOF'
 import pathlib, re
 
@@ -746,6 +761,42 @@ if inp_p.exists() and has_sym("ksu_handle_input_handle_event"):
         txt = re.sub(r'(\n\s*if\s*\(\s*is_event_supported\s*\(\s*type\s*,)', "\n" + hook + r'\1', txt, count=1)
         inp_p.write_text(txt)
         print("[OK] Patched drivers/input/input.c")
+
+# Hook 6: kernel/sys.c (setresuid untuk eskalasi UID ke root & profil aplikasi)
+sys_p = pathlib.Path("kernel/sys.c")
+if sys_p.exists() and has_sym("ksu_handle_setresuid"):
+    txt = sys_p.read_text()
+    if "ksu_handle_setresuid" not in txt:
+        is_ptr = bool(re.search(r'\bksu_handle_setresuid\s*\(\s*uid_t\s*\*', ksu_all))
+        if is_ptr:
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern int ksu_handle_setresuid(uid_t *ruid, uid_t *euid, uid_t *suid);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tksu_handle_setresuid(&ruid, &euid, &suid);\n"
+                "#endif\n"
+            )
+        else:
+            decl = (
+                "#ifdef CONFIG_KSU\n"
+                "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
+                "#endif\n"
+            )
+            hook = (
+                "#ifdef CONFIG_KSU\n"
+                "\tksu_handle_setresuid(ruid, euid, suid);\n"
+                "#endif\n"
+            )
+        txt = re.sub(r'(SYSCALL_DEFINE3\s*\(\s*setresuid\b)', decl + r'\1', txt, count=1)
+        if re.search(r'\n\s*if\s*\(\s*!uid_valid\s*\(\s*kruid\s*\)', txt):
+            txt = re.sub(r'(\n\s*if\s*\(\s*!uid_valid\s*\(\s*kruid\s*\))', "\n" + hook + r'\1', txt, count=1)
+        else:
+            txt = re.sub(r'(\n\s*retval\s*=\s*security_task_fix_setuid\s*\()', "\n" + hook + r'\1', txt, count=1)
+        sys_p.write_text(txt)
+        print("[OK] Patched kernel/sys.c (setresuid root hook)")
 EOF
 
 # 8. Patch kompatibilitas VFS Linux 4.4 untuk fs/nomount
