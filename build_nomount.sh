@@ -115,7 +115,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + embed preinit runner blob + shim header & tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU + patch blob.S preinit + shim header & tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -227,7 +227,7 @@ global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
 
-# Baca Kbuild utama & sub-Kbuild sebelum dikonversi
+# Baca Kbuild utama sebelum dikonversi
 raw = ""
 if kbuild_f.exists():
     raw = kbuild_f.read_text()
@@ -235,64 +235,7 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-sub_raws = []
-for sub_kb in sorted(ksu_dir.glob("*/Kbuild")) + sorted(ksu_dir.glob("*/Makefile")):
-    sub_dir_rel = sub_kb.parent.relative_to(ksu_dir).as_posix()
-    sub_raws.append((sub_dir_rel, sub_kb.read_text()))
-
-def run_kbuild_generators(kb_text, rel_sub=""):
-    kb_text = re.sub(r'\\\r?\n', ' ', kb_text)
-    base_src = f"drivers/kernelsu/{rel_sub}".rstrip("/")
-    cmds = {}
-    for m in re.finditer(r'^\s*cmd_([A-Za-z0-9_]+)\s*:?=\s*(.+)$', kb_text, re.M):
-        cmds[m.group(1)] = m.group(2).strip()
-
-    for m in re.finditer(r'^\s*([^\s:#=]+)\s*:\s*([^\n]+)', kb_text, re.M):
-        target_raw = m.group(1).strip()
-        deps_raw = m.group(2).strip()
-        if target_raw.endswith(".o") or target_raw.startswith("."):
-            continue
-        pos = m.end()
-        recipe_lines = []
-        for rline in kb_text[pos:].splitlines():
-            if not rline.strip():
-                continue
-            if rline.startswith(("\t", " ")) and not rline.lstrip().startswith("#"):
-                recipe_lines.append(rline.strip())
-            else:
-                break
-        if not recipe_lines:
-            continue
-
-        def expand_vars(s, tgt, deps):
-            first_dep = deps.split()[0] if deps.split() else ""
-            s = s.replace("$@", tgt).replace("$<", first_dep).replace("$^", deps)
-            s = s.replace("$(srctree)", ".").replace("$(objtree)", ".")
-            s = s.replace("$(src)", base_src).replace("$(obj)", base_src)
-            s = s.replace("$(SRCARCH)", "arm64").replace("$(ARCH)", "arm64")
-            s = s.replace("$(CC)", "clang").replace("$(CPP)", "clang -E")
-            s = s.replace("$(HOSTCC)", "gcc").replace("$(AWK)", "awk")
-            s = s.replace("$(SED)", "sed").replace("$(PERL)", "perl")
-            s = s.replace("$(PYTHON3)", "python3").replace("$(PYTHON)", "python3")
-            return s
-
-        tgt_path = expand_vars(target_raw, "", "")
-        deps_exp = expand_vars(deps_raw, tgt_path, "")
-        pathlib.Path(tgt_path).parent.mkdir(parents=True, exist_ok=True)
-
-        for r in recipe_lines:
-            cm = re.match(r'^\$\(call\s+(?:if_changed(?:_dep|_rule)?,)?cmd,([A-Za-z0-9_]+)\)', r)
-            if cm and cm.group(1) in cmds:
-                cmd_str = expand_vars(cmds[cm.group(1)], tgt_path, deps_exp)
-            else:
-                cmd_str = expand_vars(r.lstrip("@- "), tgt_path, deps_exp)
-            subprocess.run(cmd_str, shell=True, check=False)
-
-run_kbuild_generators(raw)
-for sub_rel, s_txt in sub_raws:
-    run_kbuild_generators(s_txt, sub_rel)
-
-# Fallback jika compat/syscall_no.h belum terbuat atau kosong
+# Buat compat/syscall_no.h
 sys_h = ksu_dir / "compat" / "syscall_no.h"
 if not sys_h.exists() or sys_h.stat().st_size == 0:
     u32_map = {}
@@ -319,9 +262,9 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     lines.append("#endif")
     sys_h.parent.mkdir(parents=True, exist_ok=True)
     sys_h.write_text("\n".join(lines) + "\n")
-    print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
+    print(f"[OK] Generated syscall_no.h ({len(u32_map)} compat syscalls)")
 
-# Kompilasi biner preinit/runner/runner.c (dengan semua folder include nolibc.h)
+# Siapkan biner preinit runner untuk di-embed oleh preinit/blob.S
 runner_c = ksu_dir / "preinit" / "runner" / "runner.c"
 runner_bin = pathlib.Path("/tmp/ksu_preinit_runner")
 inc_flags = []
@@ -401,43 +344,26 @@ for s in active_lines:
             if tok.endswith(".o") and tok not in objs:
                 objs.append(tok)
 
-# Tambahkan preinit/*.c, preinit/*.S, dan definisi simbol ksu_preinit_runner_start/end
+# Tambahkan preinit/*.c & preinit/*.S, dan patch direktif .incbin di blob.S menjadi string literal
 preinit_dir = ksu_dir / "preinit"
 if preinit_dir.is_dir():
-    preinit_texts = []
-    for pf in sorted(preinit_dir.iterdir()):
-        if pf.is_file() and (pf.suffix in (".c", ".S", ".s", ".h") or pf.name in ("Kbuild", "Makefile")):
-            pt = pf.read_text(errors="ignore")
-            preinit_texts.append(pt)
-            if runner_bin.exists():
-                for m_inc in re.finditer(r'\.incbin\s+"([^"]+)"', pt):
-                    inc_rel = m_inc.group(1)
-                    for base_d in (preinit_dir, pathlib.Path("out/drivers/kernelsu/preinit"), pathlib.Path("out")):
-                        dst_f = base_d / inc_rel
-                        dst_f.parent.mkdir(parents=True, exist_ok=True)
-                        if not dst_f.exists():
-                            dst_f.write_bytes(runner_bin.read_bytes())
+    for p in sorted(preinit_dir.glob("*.S")):
+        stxt = p.read_text(errors="ignore")
+        if ".incbin" in stxt and runner_bin.exists():
+            stxt = re.sub(
+                r'^(\s*\.incbin\s+).*$',
+                rf'\1"{runner_bin.as_posix()}"',
+                stxt,
+                flags=re.M,
+            )
+            p.write_text(stxt)
+            print(f"[OK] Patched .incbin di {p.name} -> {runner_bin}")
 
     for p in sorted(preinit_dir.glob("*.c")) + sorted(preinit_dir.glob("*.S")):
         o_rel = p.relative_to(ksu_dir).as_posix()[:-2] + ".o"
         if o_rel not in objs:
             objs.append(o_rel)
             print(f"[OK] Menambahkan objek preinit: {o_rel}")
-
-    combined_preinit = "\n".join(preinit_texts)
-    if "ksu_preinit_runner_start" not in combined_preinit and runner_bin.exists():
-        blob_s = preinit_dir / "ksu_runner_blob.S"
-        blob_s.write_text(
-            '.section .init.rodata, "a"\n'
-            '.balign 8\n'
-            '.globl ksu_preinit_runner_start\n'
-            'ksu_preinit_runner_start:\n'
-            f'.incbin "{runner_bin}"\n'
-            '.globl ksu_preinit_runner_end\n'
-            'ksu_preinit_runner_end:\n'
-        )
-        objs.append("preinit/ksu_runner_blob.o")
-        print(f"[OK] Membuat ksu_runner_blob.S ({runner_bin.stat().st_size} bytes)")
 
 obj_list = " \\\n\t".join(objs)
 active_defs = " ".join(f"-D{c}=1" for c in sorted(enabled_configs) if c.startswith("CONFIG_KSU"))
