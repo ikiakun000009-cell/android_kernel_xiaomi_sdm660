@@ -561,26 +561,20 @@ echo "[INFO] Memasang 7 manual hooks resmi BakaSU..."
 python3 - << 'EOF'
 import pathlib, re
 
-# Hook 1: fs/exec.c -> ksu_handle_execveat
+# Hook 1: fs/exec.c -> ksu_handle_execveat (langsung tanpa ksu_execveat_hook)
 exec_p = pathlib.Path("fs/exec.c")
 if exec_p.exists():
     txt = exec_p.read_text()
     if "ksu_handle_execveat" not in txt:
         decl = (
             "#ifdef CONFIG_KSU\n"
-            "extern bool ksu_execveat_hook __read_mostly;\n"
             "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
             "                               void *envp, int *flags);\n"
-            "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n"
-            "                                        void *argv, void *envp, int *flags);\n"
             "#endif\n"
         )
         hook = (
             "#ifdef CONFIG_KSU\n"
-            "\tif (unlikely(ksu_execveat_hook))\n"
-            "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
-            "\telse\n"
-            "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
+            "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
             "#endif\n"
         )
         txt = re.sub(r'(static\s+int\s+do_execveat_common\s*\()', decl + r'\1', txt, count=1)
@@ -609,21 +603,19 @@ if open_p.exists():
         open_p.write_text(txt)
         print("[OK] Hook 2: fs/open.c (ksu_handle_faccessat)")
 
-# Hook 3: fs/read_write.c -> ksu_handle_sys_read (BakaSU memakai ksu_handle_sys_read di SYSCALL_DEFINE3(read))
+# Hook 3: fs/read_write.c -> ksu_handle_sys_read (langsung tanpa ksu_vfs_read_hook)
 rw_p = pathlib.Path("fs/read_write.c")
 if rw_p.exists():
     txt = rw_p.read_text()
     if "ksu_handle_sys_read" not in txt:
         decl = (
             "#ifdef CONFIG_KSU\n"
-            "extern bool ksu_vfs_read_hook __read_mostly;\n"
             "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
             "#endif\n"
         )
         hook = (
             "#ifdef CONFIG_KSU\n"
-            "\tif (unlikely(ksu_vfs_read_hook))\n"
-            "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+            "\tksu_handle_sys_read(fd, &buf, &count);\n"
             "#endif\n"
         )
         m_rd = re.search(r'SYSCALL_DEFINE3\s*\(\s*read\s*,', txt)
