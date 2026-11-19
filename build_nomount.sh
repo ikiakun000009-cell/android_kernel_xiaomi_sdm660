@@ -96,7 +96,7 @@ for cfg in \
     grep -q "^$cfg" "$DEFCONFIG_PATH" || echo "$cfg" >> "$DEFCONFIG_PATH"
 done
 
-# 5. Siapkan variabel toolchain & generate out/.config lebih dulu agar semua simbol Kconfig terbaca
+# 5. Siapkan variabel toolchain & generate out/.config
 export PATH="$CLANG_DIR:$PATH"
 export ARCH=arm64
 export SUBARCH=arm64
@@ -115,7 +115,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU (baca out/.config untuk KSU_PREINIT dll), shim header, & tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU (ekspansi addprefix + auto-link preinit.o), shim header, & tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -237,6 +237,22 @@ elif makefile_f.exists():
 
 raw = re.sub(r'\\\r?\n', ' ', raw)
 
+# Ekspansi fungsi GNU Make $(addprefix ...) dan $(wildcard ...) di Kbuild
+ap_pat = re.compile(r'\$\(addprefix\s+([^,\s]+)\s*,\s*([^)]+)\)')
+while ap_pat.search(raw):
+    raw = ap_pat.sub(lambda m: " ".join(m.group(1) + item for item in m.group(2).split()), raw)
+
+wc_pat = re.compile(r'\$\(wildcard\s+([^)]+)\)')
+raw = wc_pat.sub(
+    lambda m: " ".join(
+        sorted(
+            p.relative_to(ksu_dir).as_posix()
+            for p in ksu_dir.glob(m.group(1).strip().replace("$(src)/", "").replace("$(obj)/", ""))
+        )
+    ),
+    raw,
+)
+
 # Jalankan aturan generator header (.h) dari Kbuild (seperti compat/syscall_no.h)
 cmds = {}
 for m in re.finditer(r'^\s*cmd_([A-Za-z0-9_]+)\s*:?=\s*(.+)$', raw, re.M):
@@ -310,7 +326,7 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     sys_h.write_text("\n".join(lines) + "\n")
     print(f"[OK] Fallback syscall_no.h dibuat ({len(u32_map)} compat syscalls)")
 
-# Evaluasi blok kondisional Kbuild terhadap out/.config (termasuk CONFIG_KSU_PREINIT)
+# Evaluasi blok kondisional Kbuild terhadap out/.config
 active_lines = []
 skip_stack = []
 for line in raw.splitlines():
@@ -346,7 +362,6 @@ for line in raw.splitlines():
     if not any(skip_stack):
         active_lines.append(s)
 
-# Kumpulkan seluruh .o dari kernelsu-objs, kernelsu-y, kernelsu-$(CONFIG_*), dan obj-$(CONFIG_*)
 objs = []
 for s in active_lines:
     m_lhs = re.match(
@@ -376,13 +391,43 @@ for s in active_lines:
                     if o_rel not in objs:
                         objs.append(o_rel)
 
-# Pastikan preinit ikut masuk jika CONFIG_KSU_PREINIT aktif di .config
-if "CONFIG_KSU_PREINIT" in enabled_configs:
-    for p in sorted(ksu_dir.rglob("*preinit*.c")):
-        rel = p.relative_to(ksu_dir).as_posix()
-        o_rel = rel[:-2] + ".o"
-        if o_rel not in objs:
-            objs.append(o_rel)
+# Pastikan seluruh file .c arm64 BakaSU (termasuk preinit.c) ikut terkompilasi
+excluded_kw = ("test", "example", "susfs", "lkm", "tracepoint", "kprobes",
+               "syscall_hook", "inline_hook", "x86", "arm32", "riscv", "hook/arm/")
+for p in sorted(ksu_dir.rglob("*.c")):
+    rel = p.relative_to(ksu_dir).as_posix()
+    if any(k in rel.lower() for k in excluded_kw):
+        continue
+    o_rel = rel[:-2] + ".o"
+    if o_rel not in objs:
+        objs.append(o_rel)
+
+# Resolusi transitif simbol ksu_*: pastikan setiap fungsi ksu_* yang dipanggil punya definisi di objs
+sym_def_map = {}
+for p in sorted(ksu_dir.rglob("*.c")):
+    rel = p.relative_to(ksu_dir).as_posix()
+    if any(k in rel.lower() for k in ("test", "example", "x86", "arm32", "riscv", "hook/arm/")):
+        continue
+    ctxt = p.read_text(errors="ignore")
+    for m in re.finditer(r'^(?:[a-zA-Z_][\w\s\*]+?)\b(ksu_[a-zA-Z0-9_]+)\s*\(', ctxt, re.M):
+        sym_def_map.setdefault(m.group(1), []).append(rel[:-2] + ".o")
+
+changed = True
+while changed:
+    changed = False
+    used_syms = set()
+    for o_rel in objs:
+        c_p = ksu_dir / (o_rel[:-2] + ".c")
+        if c_p.exists():
+            used_syms.update(re.findall(r'\bksu_[a-zA-Z0-9_]+\b', c_p.read_text(errors="ignore")))
+    for sym in sorted(used_syms):
+        for cand_o in sym_def_map.get(sym, []):
+            if any(k in cand_o.lower() for k in excluded_kw):
+                continue
+            if cand_o not in objs:
+                objs.append(cand_o)
+                print(f"[OK] Auto-linked {cand_o} (untuk simbol {sym})")
+                changed = True
 
 obj_list = " \\\n\t".join(objs)
 active_defs = " ".join(f"-D{c}=1" for c in sorted(enabled_configs) if c.startswith("CONFIG_KSU"))
@@ -421,7 +466,7 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-v
 subdir-ccflags-y += $(ccflags-y)
 """
 makefile_f.write_text(mk)
-print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
+print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek):", ", ".join(o for o in objs if "preinit" in o) or "cek objek")
 
 # Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
 lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
