@@ -178,7 +178,7 @@ for rel_h, body in shims.items():
         guard = "_KSU_SHIM_" + re.sub(r'[^A-Za-z0-9]', '_', rel_h).upper()
         dst.write_text(f"#ifndef {guard}\n#define {guard}\n{body}#endif\n")
 
-# Buat ksu_44_shim.h termasuk adapter kernel_read() & kernel_write() untuk Linux < 4.14
+# Buat ksu_44_shim.h dengan adapter _Generic kernel_read() & kernel_write() Linux 4.4
 shim_lines = [
     "#ifndef _KSU_44_GLOBAL_SHIM_H",
     "#define _KSU_44_GLOBAL_SHIM_H",
@@ -194,7 +194,7 @@ shim_lines = [
     "#include <linux/ktime.h>",
     "#include <linux/compat.h>",
     "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)",
-    "static inline ssize_t ksu_44_kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)",
+    "static inline ssize_t ksu_44_kernel_read_414(struct file *file, void *buf, size_t count, loff_t *pos)",
     "{",
     "    loff_t offset = pos ? *pos : 0;",
     "    ssize_t ret = kernel_read(file, offset, (char *)buf, count);",
@@ -202,7 +202,13 @@ shim_lines = [
     "        *pos = offset + ret;",
     "    return ret;",
     "}",
-    "static inline ssize_t ksu_44_kernel_write(struct file *file, const void *buf, size_t count, loff_t *pos)",
+    "static inline ssize_t ksu_44_kernel_read_44(struct file *file, loff_t offset, char *buf, unsigned long count)",
+    "{",
+    "    return kernel_read(file, offset, buf, count);",
+    "}",
+    "#define kernel_read(file, a2, a3, a4) \\",
+    "    _Generic((a4), loff_t *: ksu_44_kernel_read_414, default: ksu_44_kernel_read_44)((file), (a2), (a3), (a4))",
+    "static inline ssize_t ksu_44_kernel_write_414(struct file *file, const void *buf, size_t count, loff_t *pos)",
     "{",
     "    loff_t offset = pos ? *pos : 0;",
     "    ssize_t ret = kernel_write(file, (const char *)buf, count, offset);",
@@ -210,8 +216,12 @@ shim_lines = [
     "        *pos = offset + ret;",
     "    return ret;",
     "}",
-    "#define kernel_read(file, buf, count, pos) ksu_44_kernel_read((file), (buf), (count), (pos))",
-    "#define kernel_write(file, buf, count, pos) ksu_44_kernel_write((file), (buf), (count), (pos))",
+    "static inline ssize_t ksu_44_kernel_write_44(struct file *file, const char *buf, size_t count, loff_t offset)",
+    "{",
+    "    return kernel_write(file, buf, count, offset);",
+    "}",
+    "#define kernel_write(file, a2, a3, a4) \\",
+    "    _Generic((a4), loff_t *: ksu_44_kernel_write_414, default: ksu_44_kernel_write_44)((file), (a2), (a3), (a4))",
     "#endif",
     "#ifndef in_compat_syscall",
     "#define in_compat_syscall() is_compat_task()",
@@ -260,7 +270,7 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Hitung KSU_VERSION >= 35300 agar selalu kompatibel dengan Manager v4.2.0-rc3_35262+
+# Hitung KSU_VERSION >= 35300 agar menghilangkan banner 'Kernel update required'
 def run_git(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -460,14 +470,20 @@ subdir-ccflags-y += $(ccflags-y)
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
-# Bersihkan slot custom/PR key kosong di apk_sign.c agar built-in BakaSU release key aktif
+# Pastikan KSU_VERSION tidak tertimpa 30000 & slot custom/PR key kosong tidak memicu error
 for hdr_or_c in ksu_dir.rglob("*"):
     if hdr_or_c.suffix in (".c", ".h"):
         htxt = hdr_or_c.read_text(errors="ignore")
         new_htxt = re.sub(
+            r'^(\s*#\s*define\s+KSU_VERSION)\s+30000\b',
+            rf'\1 {ksu_ver}',
+            htxt,
+            flags=re.M,
+        )
+        new_htxt = re.sub(
             r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?SIZE)\s*$',
             r'\1 0x033b',
-            htxt,
+            new_htxt,
             flags=re.M,
         )
         new_htxt = re.sub(
