@@ -18,7 +18,7 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU (clone riwayat penuh agar hitungan KSU_VERSION akurat)
+# 2. Integrasi BakaSU (clone riwayat penuh agar hitungan versi & tag git akurat)
 if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Mengkloning BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
     rm -rf KernelSU drivers/kernelsu
@@ -33,6 +33,7 @@ if [ ! -e "drivers/kernelsu" ]; then
         cp -rf KernelSU/uapi drivers/kernelsu/uapi
         [ ! -e "drivers/uapi" ] && cp -rf KernelSU/uapi drivers/uapi
     fi
+    [ -d "KernelSU/.git" ] && cp -rf KernelSU/.git drivers/kernelsu/.git
 
     grep -q "drivers/kernelsu" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
     grep -q "drivers/kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
@@ -115,7 +116,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + ekstrak versi & signature manager asli + tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU + evaluasi semua flag -D asli (versi & sertifikat manager) + tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -235,43 +236,114 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Ekstrak versi kernel BakaSU serta EXPECTED_SIZE & EXPECTED_HASH asli APK Manager
-def run_git(cmd):
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else ""
+raw_joined = re.sub(r'\\\r?\n', ' ', raw)
 
-git_count_str = run_git("git -C KernelSU rev-list --count HEAD")
-git_count = int(git_count_str) if git_count_str.isdigit() and int(git_count_str) > 1 else 25000
+# Kumpulkan definisi variabel dari Kbuild dan evaluasi ekspresi $(...) / $(shell ...)
+kb_vars = {
+    "srctree": os.path.abspath("."),
+    "objtree": os.path.abspath("out"),
+    "src": os.path.abspath("drivers/kernelsu"),
+    "obj": os.path.abspath("out/drivers/kernelsu"),
+}
+for line in raw_joined.splitlines():
+    s = line.strip()
+    m_var = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(?::?=|\?=|\+=)\s*(.+)$', s)
+    if m_var and not m_var.group(1).startswith(("obj-", "kernelsu-", "ccflags-", "subdir-ccflags-")):
+        k, v = m_var.group(1), m_var.group(2).strip()
+        if "+=" in s and k in kb_vars:
+            kb_vars[k] = kb_vars[k] + " " + v
+        else:
+            kb_vars[k] = v
 
-ksu_ver = None
-m_ver_expr = re.search(r'KSU_VERSION\s*:?=\s*\$\(shell\s+expr\s+([^\)]+)\)', raw)
-if m_ver_expr:
-    expr_s = m_ver_expr.group(1).replace("$(KSU_GIT_VERSION)", str(git_count))
-    nums = [int(x) for x in re.findall(r'\b\d+\b', expr_s)]
-    if nums and "+" in expr_s:
-        ksu_ver = sum(nums)
-if not ksu_ver:
-    m_ver_lit = re.search(r'KSU_VERSION\s*:?=\s*(\d+)', raw)
-    if m_ver_lit:
-        ksu_ver = int(m_ver_lit.group(1))
-if not ksu_ver or ksu_ver < 20000:
-    ksu_ver = 30000 + git_count
+def eval_make_expr(text, depth=0):
+    if depth > 12 or "$(" not in text:
+        return text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i:i+2] == "$(":
+            lvl = 1
+            j = i + 2
+            while j < n and lvl > 0:
+                if text[j] == "(":
+                    lvl += 1
+                elif text[j] == ")":
+                    lvl -= 1
+                j += 1
+            inner = text[i+2:j-1]
+            if inner.startswith("shell "):
+                cmd = eval_make_expr(inner[6:].strip(), depth + 1)
+                res = subprocess.run(cmd, shell=True, cwd="drivers/kernelsu", capture_output=True, text=True)
+                out.append(res.stdout.strip().replace("\n", " "))
+            elif inner.startswith("addprefix "):
+                rest = inner[10:].strip()
+                if "," in rest:
+                    pfx, items = rest.split(",", 1)
+                    pfx = eval_make_expr(pfx.strip(), depth + 1)
+                    items = eval_make_expr(items.strip(), depth + 1)
+                    out.append(" ".join(pfx + it for it in items.split()))
+            elif inner in kb_vars:
+                out.append(eval_make_expr(kb_vars[inner], depth + 1))
+            else:
+                out.append(os.environ.get(inner, ""))
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
-ver_full = run_git("git -C KernelSU describe --tags --always")
-if not ver_full or not ver_full.startswith("v"):
-    m_vf = re.search(r'KSU_VERSION_FULL\s*:?=\s*\\?"?([^"\s\)]+)', raw)
-    ver_full = m_vf.group(1) if m_vf else f"v3.0.0-{git_count}"
+# Ekstrak seluruh flag -D dari ccflags-y / subdir-ccflags-y pada Kbuild asli BakaSU
+kbuild_d_flags = []
+seen_d_names = set()
+for line in raw_joined.splitlines():
+    s = line.strip()
+    if re.match(r'^(?:subdir-)?ccflags-[a-zA-Z0-9_$()]+\s*\+?=', s):
+        rhs = eval_make_expr(s.split("=", 1)[1].strip())
+        for tok in rhs.split():
+            if tok.startswith("-D"):
+                d_name = tok[2:].split("=", 1)[0]
+                if d_name not in seen_d_names:
+                    seen_d_names.add(d_name)
+                    kbuild_d_flags.append(tok)
 
-all_ksu_src = raw + "\n" + "\n".join(
+# Pastikan KSU_VERSION, EXPECTED_SIZE, dan EXPECTED_HASH valid (bukan 0 / placeholder)
+git_cnt_res = subprocess.run("git -C KernelSU rev-list --count HEAD", shell=True, capture_output=True, text=True)
+git_count = int(git_cnt_res.stdout.strip()) if git_cnt_res.stdout.strip().isdigit() else 1
+
+all_ksu_text = raw_joined + "\n" + "\n".join(
     p.read_text(errors="ignore") for p in ksu_dir.rglob("*") if p.suffix in (".c", ".h", ".mk")
 )
-m_sz = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?SIZE\s*(?::?=|=)\s*(0x[0-9a-fA-F]+|\d+)', all_ksu_src)
-exp_size = m_sz.group(1) if m_sz else "0x033b"
 
-m_hs = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?HASH\s*(?::?=|=)\s*\\?"?([0-9a-fA-F]{64})', all_ksu_src)
-exp_hash = m_hs.group(1) if m_hs else "0000000000000000000000000000000000000000000000000000000000000000"
+# Cari semua kandidat hash 64-hex non-zero & size 0x... di BakaSU
+non_zero_hashes = [
+    h for h in re.findall(r'\b([0-9a-fA-F]{64})\b', all_ksu_text)
+    if set(h) != {"0"}
+]
+hex_sizes = [
+    sz for sz in re.findall(r'\b(0x[0-9a-fA-F]{3,4})\b', raw_joined + "\n" + "\n".join(
+        p.read_text(errors="ignore") for p in ksu_dir.rglob("*sign*.c")
+    ))
+    if sz.lower() != "0x033b"
+]
+exp_hash = non_zero_hashes[0] if non_zero_hashes else "0000000000000000000000000000000000000000000000000000000000000000"
+exp_size = hex_sizes[0] if hex_sizes else "0x033b"
 
-print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Manager Size: {exp_size}, Hash: {exp_hash[:12]}...")
+if "KSU_GIT_VERSION" not in seen_d_names:
+    kbuild_d_flags.append(f"-DKSU_GIT_VERSION={git_count}")
+if "KSU_VERSION" not in seen_d_names:
+    kbuild_d_flags.append(f"-DKSU_VERSION={30000 + git_count}")
+if "KSU_VERSION_FULL" not in seen_d_names:
+    tag_res = subprocess.run("git -C KernelSU describe --tags --always", shell=True, capture_output=True, text=True)
+    vfull = tag_res.stdout.strip() or f"v3.0.0-{git_count}"
+    kbuild_d_flags.append(f'-DKSU_VERSION_FULL=\\"{vfull}\\"')
+if "EXPECTED_SIZE" not in seen_d_names:
+    kbuild_d_flags.append(f"-DEXPECTED_SIZE={exp_size}")
+if "EXPECTED_HASH" not in seen_d_names:
+    kbuild_d_flags.append(f'-DEXPECTED_HASH=\\"{exp_hash}\\"')
+
+extra_d_str = " ".join(kbuild_d_flags)
+print("[OK] Evaluated BakaSU -D flags:", extra_d_str)
 
 # Buat compat/syscall_no.h
 sys_h = ksu_dir / "compat" / "syscall_no.h"
@@ -333,14 +405,13 @@ if not runner_bin.exists():
     )
 
 # Susun daftar objek kernel dari Kbuild
-raw = re.sub(r'\\\r?\n', ' ', raw)
 ap_pat = re.compile(r'\$\(addprefix\s+([^,\s]+)\s*,\s*([^)]+)\)')
-while ap_pat.search(raw):
-    raw = ap_pat.sub(lambda m: " ".join(m.group(1) + item for item in m.group(2).split()), raw)
+while ap_pat.search(raw_joined):
+    raw_joined = ap_pat.sub(lambda m: " ".join(m.group(1) + item for item in m.group(2).split()), raw_joined)
 
 active_lines = []
 skip_stack = []
-for line in raw.splitlines():
+for line in raw_joined.splitlines():
     s = line.strip()
     if not s or s.startswith("#"):
         continue
@@ -435,10 +506,7 @@ ccflags-y += -I$(srctree)/security/selinux/include
 ccflags-y += -I$(objtree)/security/selinux
 ccflags-y += -I$(objtree)/security/selinux/include
 ccflags-y += {active_defs}
-ccflags-y += -DKSU_GIT_VERSION={git_count} -DKSU_VERSION={ksu_ver} -DKSU_VERSION_FULL=\\"{ver_full}\\"
-ccflags-y += -DEXPECTED_SIZE={exp_size} -DEXPECTED_HASH=\\"{exp_hash}\\"
-ccflags-y += -DKSU_EXPECTED_SIZE={exp_size} -DKSU_EXPECTED_HASH=\\"{exp_hash}\\"
-ccflags-y += -DEXPECTED_MANAGER_SIZE={exp_size} -DEXPECTED_MANAGER_HASH=\\"{exp_hash}\\"
+ccflags-y += {extra_d_str}
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
 subdir-ccflags-y += $(ccflags-y)
