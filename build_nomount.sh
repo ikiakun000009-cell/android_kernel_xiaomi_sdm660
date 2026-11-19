@@ -450,6 +450,9 @@ ccflags-y += {active_defs}
 ccflags-y += -DKSU_GIT_VERSION={git_count} -DKSU_VERSION={ksu_ver} -DKSU_VERSION_FULL=\\"{ver_full}\\"
 ccflags-y += -DEXPECTED_SIZE={exp_size} -DEXPECTED_HASH=\\"{exp_hash}\\"
 ccflags-y += -DEXPECTED_PR_BUILD_SIZE={exp_size} -DEXPECTED_PR_BUILD_HASH=\\"{exp_hash}\\"
+ccflags-y += -DEXPECTED_SIZE_BAKASU={exp_size} -DEXPECTED_HASH_BAKASU=\\"{exp_hash}\\"
+ccflags-y += -DEXPECTED_SIZE_OFFICIAL={exp_size} -DEXPECTED_HASH_OFFICIAL=\\"{exp_hash}\\"
+ccflags-y += -DEXPECTED_SIZE_KOWX712={exp_size} -DEXPECTED_HASH_KOWX712=\\"{exp_hash}\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
 subdir-ccflags-y += $(ccflags-y)
@@ -457,7 +460,7 @@ subdir-ccflags-y += $(ccflags-y)
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
-# Pastikan KSU_VERSION tidak tertimpa 30000 & sertifikat 0x377 aktif di apk_sign.c
+# Pastikan KSU_VERSION tidak tertimpa 30000 & seluruh makro EXPECTED_SIZE_*/EXPECTED_HASH_* terisi
 for hdr_or_c in ksu_dir.rglob("*"):
     if hdr_or_c.suffix in (".c", ".h"):
         htxt = hdr_or_c.read_text(errors="ignore")
@@ -468,13 +471,13 @@ for hdr_or_c in ksu_dir.rglob("*"):
             flags=re.M,
         )
         new_htxt = re.sub(
-            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?SIZE).*$',
+            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?SIZE(?:_[A-Z0-9_]+)?).*$',
             rf'\1 {exp_size}',
             new_htxt,
             flags=re.M,
         )
         new_htxt = re.sub(
-            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?HASH).*$',
+            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?HASH(?:_[A-Z0-9_]+)?).*$',
             rf'\1 "{exp_hash}"',
             new_htxt,
             flags=re.M,
@@ -485,18 +488,8 @@ for hdr_or_c in ksu_dir.rglob("*"):
 apk_sign_f = ksu_dir / "manager" / "apk_sign.c"
 if apk_sign_f.exists():
     atxt = apk_sign_f.read_text(errors="ignore")
-    atxt = re.sub(
-        r'^\s*\{\s*EXPECTED_PR_BUILD_SIZE\s*,\s*EXPECTED_PR_BUILD_HASH\s*\}\s*,?.*$',
-        f'    {{ {exp_size}, "{exp_hash}" }},',
-        atxt,
-        flags=re.M,
-    )
-    atxt = re.sub(
-        r'^\s*\{\s*EXPECTED_SIZE\s*,\s*EXPECTED_HASH\s*\}\s*,?.*$',
-        f'    {{ {exp_size}, "{exp_hash}" }},',
-        atxt,
-        flags=re.M,
-    )
+    atxt = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?SIZE(?:_[A-Z0-9_]+)?\b', exp_size, atxt)
+    atxt = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?HASH(?:_[A-Z0-9_]+)?\b', f'"{exp_hash}"', atxt)
     apk_sign_f.write_text(atxt)
     print(f"[OK] apk_sign.c diperbarui dengan sertifikat HP ({exp_size})")
 
