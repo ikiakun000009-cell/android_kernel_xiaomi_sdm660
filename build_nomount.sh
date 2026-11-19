@@ -18,11 +18,11 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU (salin langsung + folder uapi agar aman untuk O=out 4.4)
+# 2. Integrasi BakaSU (clone riwayat penuh agar hitungan KSU_VERSION akurat)
 if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Mengkloning BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
     rm -rf KernelSU drivers/kernelsu
-    git clone --depth=1 -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
+    git clone -b "$BAKASU_BRANCH" "$BAKASU_REPO" KernelSU
 
     if [ -d "KernelSU/kernel" ]; then
         cp -rf KernelSU/kernel drivers/kernelsu
@@ -115,7 +115,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + patch blob.S preinit + shim header & tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU + ekstrak versi & signature manager asli + tambalan 4.4.302
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -234,6 +234,44 @@ if kbuild_f.exists():
     kbuild_f.unlink()
 elif makefile_f.exists():
     raw = makefile_f.read_text()
+
+# Ekstrak versi kernel BakaSU serta EXPECTED_SIZE & EXPECTED_HASH asli APK Manager
+def run_git(cmd):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+git_count_str = run_git("git -C KernelSU rev-list --count HEAD")
+git_count = int(git_count_str) if git_count_str.isdigit() and int(git_count_str) > 1 else 25000
+
+ksu_ver = None
+m_ver_expr = re.search(r'KSU_VERSION\s*:?=\s*\$\(shell\s+expr\s+([^\)]+)\)', raw)
+if m_ver_expr:
+    expr_s = m_ver_expr.group(1).replace("$(KSU_GIT_VERSION)", str(git_count))
+    nums = [int(x) for x in re.findall(r'\b\d+\b', expr_s)]
+    if nums and "+" in expr_s:
+        ksu_ver = sum(nums)
+if not ksu_ver:
+    m_ver_lit = re.search(r'KSU_VERSION\s*:?=\s*(\d+)', raw)
+    if m_ver_lit:
+        ksu_ver = int(m_ver_lit.group(1))
+if not ksu_ver or ksu_ver < 20000:
+    ksu_ver = 30000 + git_count
+
+ver_full = run_git("git -C KernelSU describe --tags --always")
+if not ver_full or not ver_full.startswith("v"):
+    m_vf = re.search(r'KSU_VERSION_FULL\s*:?=\s*\\?"?([^"\s\)]+)', raw)
+    ver_full = m_vf.group(1) if m_vf else f"v3.0.0-{git_count}"
+
+all_ksu_src = raw + "\n" + "\n".join(
+    p.read_text(errors="ignore") for p in ksu_dir.rglob("*") if p.suffix in (".c", ".h", ".mk")
+)
+m_sz = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?SIZE\s*(?::?=|=)\s*(0x[0-9a-fA-F]+|\d+)', all_ksu_src)
+exp_size = m_sz.group(1) if m_sz else "0x033b"
+
+m_hs = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?HASH\s*(?::?=|=)\s*\\?"?([0-9a-fA-F]{64})', all_ksu_src)
+exp_hash = m_hs.group(1) if m_hs else "0000000000000000000000000000000000000000000000000000000000000000"
+
+print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Manager Size: {exp_size}, Hash: {exp_hash[:12]}...")
 
 # Buat compat/syscall_no.h
 sys_h = ksu_dir / "compat" / "syscall_no.h"
@@ -397,8 +435,10 @@ ccflags-y += -I$(srctree)/security/selinux/include
 ccflags-y += -I$(objtree)/security/selinux
 ccflags-y += -I$(objtree)/security/selinux/include
 ccflags-y += {active_defs}
-ccflags-y += -DKSU_GIT_VERSION=14762 -DKSU_VERSION=14762 -DKSU_VERSION_FULL=\\"v3.0.0-bakasu\\"
-ccflags-y += -DEXPECTED_SIZE=0x033b -DEXPECTED_HASH=\\"0000000000000000000000000000000000000000000000000000000000000000\\"
+ccflags-y += -DKSU_GIT_VERSION={git_count} -DKSU_VERSION={ksu_ver} -DKSU_VERSION_FULL=\\"{ver_full}\\"
+ccflags-y += -DEXPECTED_SIZE={exp_size} -DEXPECTED_HASH=\\"{exp_hash}\\"
+ccflags-y += -DKSU_EXPECTED_SIZE={exp_size} -DKSU_EXPECTED_HASH=\\"{exp_hash}\\"
+ccflags-y += -DEXPECTED_MANAGER_SIZE={exp_size} -DEXPECTED_MANAGER_HASH=\\"{exp_hash}\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
 subdir-ccflags-y += $(ccflags-y)
