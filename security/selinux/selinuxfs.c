@@ -30,6 +30,7 @@
 #include <linux/uaccess.h>
 #include <linux/kobject.h>
 #include <linux/ctype.h>
+#include <linux/cred.h>
 
 /* selinuxfs pseudo filesystem for exporting the security policy API.
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
@@ -571,10 +572,21 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 	char *canon = NULL;
 	u32 sid, len;
 	ssize_t length;
+	uid_t caller_uid;
 
 	length = task_has_security(current, SECURITY__CHECK_CONTEXT);
 	if (length)
 		goto out;
+
+	caller_uid = from_kuid(&init_user_ns, current_uid()) % 100000;
+	if (caller_uid >= 90000 && caller_uid <= 99999) {
+		if (strstr(buf, ":ksu:") || strstr(buf, ":su:") ||
+		    strstr(buf, ":adb_root:") || strstr(buf, ":magisk:") ||
+		    strstr(buf, ":zygisk:")) {
+			length = -EINVAL;
+			goto out;
+		}
+	}
 
 	length = security_context_to_sid(buf, size, &sid, GFP_KERNEL);
 	if (length)
@@ -712,6 +724,8 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	u16 tclass;
 	struct av_decision avd;
 	ssize_t length;
+	uid_t caller_uid;
+	bool is_isolated_probe;
 
 	length = task_has_security(current, SECURITY__COMPUTE_AV);
 	if (length)
@@ -731,6 +745,19 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
+	caller_uid = from_kuid(&init_user_ns, current_uid()) % 100000;
+	is_isolated_probe = (caller_uid >= 90000 && caller_uid <= 99999);
+	if (is_isolated_probe) {
+		if (strstr(scon, ":ksu:") || strstr(tcon, ":ksu:") ||
+		    strstr(scon, ":su:") || strstr(tcon, ":su:") ||
+		    strstr(scon, ":adb_root:") || strstr(tcon, ":adb_root:") ||
+		    strstr(scon, ":magisk:") || strstr(tcon, ":magisk:") ||
+		    strstr(scon, ":zygisk:") || strstr(tcon, ":zygisk:")) {
+			length = -EINVAL;
+			goto out;
+		}
+	}
+
 	length = security_context_str_to_sid(scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
@@ -740,6 +767,18 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 		goto out;
 
 	security_compute_av_user(ssid, tsid, tclass, &avd);
+
+	if (is_isolated_probe) {
+		if (tclass == SECCLASS_PROCESS) {
+#ifdef PROCESS__EXECMEM
+			avd.allowed &= ~(PROCESS__EXECMEM | PROCESS__EXECSTACK | PROCESS__EXECHEAP);
+#else
+			avd.allowed &= ~0x0E000000U;
+#endif
+		}
+		if (ssid != tsid)
+			avd.allowed = 0;
+	}
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",
