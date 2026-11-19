@@ -18,7 +18,7 @@ fi
 DEFCONFIG="${DEFCONFIG_PATH#arch/arm64/configs/}"
 echo "[INFO] Menggunakan defconfig: $DEFCONFIG"
 
-# 2. Integrasi BakaSU (clone riwayat penuh agar hitungan KSU_VERSION akurat)
+# 2. Integrasi BakaSU
 if [ ! -e "drivers/kernelsu" ]; then
     echo "[INFO] Mengkloning BakaSU dari $BAKASU_REPO (branch: $BAKASU_BRANCH)..."
     rm -rf KernelSU drivers/kernelsu
@@ -44,7 +44,7 @@ if [ ! -d "fs/nomount" ] && ! grep -rqE "config NOMOUNT|nomount_init" KernelSU/ 
     curl -fsSL https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh | bash -s dev
 fi
 
-# 4. Atur Kconfig BakaSU (Full Manual Hook 6-titik) & NoMount di defconfig
+# 4. Atur Kconfig BakaSU (Full Manual Hook) & NoMount di defconfig
 python3 - << 'EOF' "$DEFCONFIG_PATH"
 import pathlib, re, sys
 
@@ -117,7 +117,7 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + tanam sertifikat APK HP (0x377) + adapter 4.4 + versi 36000
+# 6. Konversi Kbuild BakaSU + adapter 4.4 + versi 39999 (pakai EXPECTED_SIZE_BAKASU bawaan 0x377)
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
@@ -127,7 +127,6 @@ ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
 makefile_f = ksu_dir / "Makefile"
 
-# Baca simbol aktif dari out/.config
 enabled_configs = set(["CONFIG_KSU", "CONFIG_ARM64", "CONFIG_KSU_MANUAL_HOOK"])
 dot_cfg = pathlib.Path("out/.config")
 if dot_cfg.exists():
@@ -140,7 +139,6 @@ for dis in ("CONFIG_KSU_WITH_KPROBES", "CONFIG_KSU_TRACEPOINT_HOOK", "CONFIG_KSU
             "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK"):
     enabled_configs.discard(dis)
 
-# Pindai seluruh header include/linux/*.h untuk mencegah redefinition
 existing_funcs = set()
 for hdr in pathlib.Path("include/linux").glob("*.h"):
     try:
@@ -152,7 +150,6 @@ for hdr in pathlib.Path("include/linux").glob("*.h"):
     except Exception:
         pass
 
-# Buat shim header untuk header <linux/...> yang belum ada di kernel 4.4
 shims = {
     "linux/pgtable.h": "#include <linux/mm.h>\n#include <asm/pgtable.h>\n",
     "linux/set_memory.h": "#include <asm/cacheflush.h>\n",
@@ -178,7 +175,6 @@ for rel_h, body in shims.items():
         guard = "_KSU_SHIM_" + re.sub(r'[^A-Za-z0-9]', '_', rel_h).upper()
         dst.write_text(f"#ifndef {guard}\n#define {guard}\n{body}#endif\n")
 
-# Buat ksu_44_shim.h dengan adapter _Generic kernel_read() & kernel_write() Linux 4.4
 shim_lines = [
     "#ifndef _KSU_44_GLOBAL_SHIM_H",
     "#define _KSU_44_GLOBAL_SHIM_H",
@@ -262,7 +258,6 @@ global_shim = ksu_dir / "compat" / "ksu_44_shim.h"
 global_shim.parent.mkdir(parents=True, exist_ok=True)
 global_shim.write_text("\n".join(shim_lines) + "\n")
 
-# Baca Kbuild utama sebelum dikonversi
 raw = ""
 if kbuild_f.exists():
     raw = kbuild_f.read_text()
@@ -270,22 +265,18 @@ if kbuild_f.exists():
 elif makefile_f.exists():
     raw = makefile_f.read_text()
 
-# Set KSU_VERSION = 36000 & sertifikat persis milik com.resukisu.resukisu di HP user
 def run_git(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
 
-git_count = 6000
-ksu_ver = 36000
+git_count = 9999
+ksu_ver = 39999
 ver_full = run_git("git -C KernelSU describe --tags --always")
 if not ver_full or not ver_full.startswith("v"):
     ver_full = "v4.2.0-rc3"
 
-exp_size = "0x377"
-exp_hash = "d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64"
-print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Manager Cert SIZE={exp_size}, HASH={exp_hash}")
+print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), menggunakan EXPECTED_SIZE_BAKASU (0x377) bawaan manager_sign.h")
 
-# Buat compat/syscall_no.h
 sys_h = ksu_dir / "compat" / "syscall_no.h"
 if not sys_h.exists() or sys_h.stat().st_size == 0:
     u32_map = {}
@@ -314,7 +305,6 @@ if not sys_h.exists() or sys_h.stat().st_size == 0:
     sys_h.write_text("\n".join(lines) + "\n")
     print(f"[OK] Generated syscall_no.h ({len(u32_map)} compat syscalls)")
 
-# Siapkan biner preinit runner untuk di-embed oleh preinit/blob.S
 runner_c = ksu_dir / "preinit" / "runner" / "runner.c"
 runner_bin = pathlib.Path("/tmp/ksu_preinit_runner")
 inc_flags = []
@@ -344,7 +334,6 @@ if not runner_bin.exists():
         check=False,
     )
 
-# Susun daftar objek kernel dari Kbuild
 raw = re.sub(r'\\\r?\n', ' ', raw)
 ap_pat = re.compile(r'\$\(addprefix\s+([^,\s]+)\s*,\s*([^)]+)\)')
 while ap_pat.search(raw):
@@ -394,7 +383,6 @@ for s in active_lines:
             if tok.endswith(".o") and tok not in objs:
                 objs.append(tok)
 
-# Tambahkan preinit/*.c & preinit/*.S, dan patch direktif .incbin di blob.S menjadi string literal
 preinit_dir = ksu_dir / "preinit"
 if preinit_dir.is_dir():
     for p in sorted(preinit_dir.glob("*.S")):
@@ -448,11 +436,6 @@ ccflags-y += -I$(objtree)/security/selinux
 ccflags-y += -I$(objtree)/security/selinux/include
 ccflags-y += {active_defs}
 ccflags-y += -DKSU_GIT_VERSION={git_count} -DKSU_VERSION={ksu_ver} -DKSU_VERSION_FULL=\\"{ver_full}\\"
-ccflags-y += -DEXPECTED_SIZE={exp_size} -DEXPECTED_HASH=\\"{exp_hash}\\"
-ccflags-y += -DEXPECTED_PR_BUILD_SIZE={exp_size} -DEXPECTED_PR_BUILD_HASH=\\"{exp_hash}\\"
-ccflags-y += -DEXPECTED_SIZE_BAKASU={exp_size} -DEXPECTED_HASH_BAKASU=\\"{exp_hash}\\"
-ccflags-y += -DEXPECTED_SIZE_OFFICIAL={exp_size} -DEXPECTED_HASH_OFFICIAL=\\"{exp_hash}\\"
-ccflags-y += -DEXPECTED_SIZE_KOWX712={exp_size} -DEXPECTED_HASH_KOWX712=\\"{exp_hash}\\"
 ccflags-y += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable -Wno-error
 subdir-ccflags-y += $(ccflags-y)
@@ -460,45 +443,19 @@ subdir-ccflags-y += $(ccflags-y)
 makefile_f.write_text(mk)
 print(f"[OK] Makefile Kbuild 4.4 (arm64) dibuat ({len(objs)} objek)")
 
-# Pastikan KSU_VERSION tidak tertimpa 30000 & seluruh makro EXPECTED_SIZE_*/EXPECTED_HASH_* terisi
+# Pastikan KSU_VERSION=39999 & EXPECTED_SIZE_BAKASU tetap 0x377 di manager_sign.h
 for hdr_or_c in ksu_dir.rglob("*"):
     if hdr_or_c.suffix in (".c", ".h"):
         htxt = hdr_or_c.read_text(errors="ignore")
         new_htxt = re.sub(
-            r'^(\s*#\s*define\s+KSU_VERSION)\s+30000\b',
+            r'^(\s*#\s*define\s+KSU_VERSION)\s+\d+\b',
             rf'\1 {ksu_ver}',
             htxt,
-            flags=re.M,
-        )
-        new_htxt = re.sub(
-            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?SIZE(?:_[A-Z0-9_]+)?).*$',
-            rf'\1 {exp_size}',
-            new_htxt,
-            flags=re.M,
-        )
-        new_htxt = re.sub(
-            r'^(\s*#\s*define\s+EXPECTED_(?:PR_BUILD_)?HASH(?:_[A-Z0-9_]+)?).*$',
-            rf'\1 "{exp_hash}"',
-            new_htxt,
             flags=re.M,
         )
         if new_htxt != htxt:
             hdr_or_c.write_text(new_htxt)
 
-apk_sign_f = ksu_dir / "manager" / "apk_sign.c"
-if apk_sign_f.exists():
-    fixed_lines = []
-    for line in apk_sign_f.read_text(errors="ignore").splitlines():
-        if re.match(r'^\s*#\s*(?:ifdef|ifndef|if|elif|define|undef)\b', line):
-            fixed_lines.append(line)
-        else:
-            line = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?SIZE(?:_[A-Z0-9_]+)?\b', exp_size, line)
-            line = re.sub(r'\bEXPECTED_(?:PR_BUILD_)?HASH(?:_[A-Z0-9_]+)?\b', f'"{exp_hash}"', line)
-            fixed_lines.append(line)
-    apk_sign_f.write_text("\n".join(fixed_lines) + "\n")
-    print(f"[OK] apk_sign.c diperbarui dengan sertifikat HP ({exp_size})")
-
-# Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
 lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
 m_shl = re.search(r'struct\s+security_hook_list\s*\{([^}]*)\}', lsm_h, re.S)
 has_lsm_member = bool(m_shl and re.search(r'\blsm\b', m_shl.group(1)))
@@ -543,7 +500,6 @@ for lsm_file in ksu_dir.rglob("*lsm_hook_magic*.c"):
     lsm_file.write_text(ltxt)
     print("[OK] lsm_hook_magic.c disesuaikan dengan struct list_head Linux 4.4 (tanpa .lsm)")
 
-# Pastikan variabel hook global tidak tertahan keyword 'static'
 for cfile in ksu_dir.rglob("*.c"):
     ctxt = cfile.read_text(errors="ignore")
     new_ctxt = re.sub(
@@ -554,7 +510,6 @@ for cfile in ksu_dir.rglob("*.c"):
     if new_ctxt != ctxt:
         cfile.write_text(new_ctxt)
 
-# Sesuaikan struct file_operations di file_wrapper.c dengan include/linux/fs.h kernel 4.4
 fs_h = pathlib.Path("include/linux/fs.h").read_text(errors="ignore")
 for fw_file in ksu_dir.rglob("*file_wrapper*.c"):
     ftxt = fw_file.read_text(errors="ignore")
@@ -567,7 +522,6 @@ for fw_file in ksu_dir.rglob("*file_wrapper*.c"):
     fw_file.write_text(ftxt)
     print("[OK] file_wrapper.c disesuaikan dengan struct file_operations 4.4")
 
-# Hapus definisi fungsi duplikat di kernel_compat.h agar tidak bentrok dengan header kernel 4.4.302
 kc_path = ksu_dir / "compat" / "kernel_compat.h"
 if kc_path.exists():
     kc = kc_path.read_text()
@@ -602,58 +556,41 @@ if kc_path.exists():
 EOF
 fi
 
-# 7. Terapkan 6 Manual Hooks BakaSU (termasuk setresuid khusus di SYSCALL_DEFINE3(setresuid))
-echo "[INFO] Memasang manual hooks pada fs/, drivers/input/, dan kernel/sys.c..."
+# 7. Terapkan 7 Manual Hooks Resmi BakaSU (sesuai manual_hook_check.mk)
+echo "[INFO] Memasang 7 manual hooks resmi BakaSU..."
 python3 - << 'EOF'
 import pathlib, re
 
-ksu_all = "\n".join(p.read_text(errors="ignore") for p in pathlib.Path("drivers/kernelsu").rglob("*.c"))
-def has_sym(sym):
-    return bool(re.search(rf'\b{re.escape(sym)}\b', ksu_all))
-
-# Hook 1: fs/exec.c
+# Hook 1: fs/exec.c -> ksu_handle_execveat
 exec_p = pathlib.Path("fs/exec.c")
-if exec_p.exists() and has_sym("ksu_handle_execveat"):
+if exec_p.exists():
     txt = exec_p.read_text()
     if "ksu_handle_execveat" not in txt:
-        if has_sym("ksu_execveat_hook") and has_sym("ksu_handle_execveat_sucompat"):
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "extern bool ksu_execveat_hook __read_mostly;\n"
-                "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
-                "                               void *envp, int *flags);\n"
-                "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n"
-                "                                        void *argv, void *envp, int *flags);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tif (unlikely(ksu_execveat_hook))\n"
-                "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
-                "\telse\n"
-                "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
-                "#endif\n"
-            )
-        else:
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
-                "                               void *envp, int *flags);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
-                "#endif\n"
-            )
+        decl = (
+            "#ifdef CONFIG_KSU\n"
+            "extern bool ksu_execveat_hook __read_mostly;\n"
+            "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
+            "                               void *envp, int *flags);\n"
+            "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n"
+            "                                        void *argv, void *envp, int *flags);\n"
+            "#endif\n"
+        )
+        hook = (
+            "#ifdef CONFIG_KSU\n"
+            "\tif (unlikely(ksu_execveat_hook))\n"
+            "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+            "\telse\n"
+            "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
+            "#endif\n"
+        )
         txt = re.sub(r'(static\s+int\s+do_execveat_common\s*\()', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*IS_ERR\s*\(\s*filename\s*\)\s*\))', "\n" + hook + r'\1', txt, count=1)
         exec_p.write_text(txt)
-        print("[OK] Patched fs/exec.c")
+        print("[OK] Hook 1: fs/exec.c (ksu_handle_execveat)")
 
-# Hook 2: fs/open.c
+# Hook 2: fs/open.c -> ksu_handle_faccessat
 open_p = pathlib.Path("fs/open.c")
-if open_p.exists() and has_sym("ksu_handle_faccessat"):
+if open_p.exists():
     txt = open_p.read_text()
     if "ksu_handle_faccessat" not in txt:
         decl = (
@@ -670,47 +607,36 @@ if open_p.exists() and has_sym("ksu_handle_faccessat"):
         txt = re.sub(r'(SYSCALL_DEFINE3\s*\(\s*faccessat\b)', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*mode\s*&\s*~S_IRWXO\s*\))', "\n" + hook + r'\1', txt, count=1)
         open_p.write_text(txt)
-        print("[OK] Patched fs/open.c")
+        print("[OK] Hook 2: fs/open.c (ksu_handle_faccessat)")
 
-# Hook 3: fs/read_write.c
+# Hook 3: fs/read_write.c -> ksu_handle_sys_read (BakaSU memakai ksu_handle_sys_read di SYSCALL_DEFINE3(read))
 rw_p = pathlib.Path("fs/read_write.c")
-if rw_p.exists() and has_sym("ksu_handle_vfs_read"):
+if rw_p.exists():
     txt = rw_p.read_text()
-    if "ksu_handle_vfs_read" not in txt:
-        if has_sym("ksu_vfs_read_hook"):
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "extern bool ksu_vfs_read_hook __read_mostly;\n"
-                "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n"
-                "                               size_t *count_ptr, loff_t **pos);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tif (unlikely(ksu_vfs_read_hook))\n"
-                "\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
-                "#endif\n"
-            )
-        else:
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n"
-                "                               size_t *count_ptr, loff_t **pos);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
-                "#endif\n"
-            )
-        txt = re.sub(r'(ssize_t\s+vfs_read\s*\()', decl + r'\1', txt, count=1)
-        txt = re.sub(r'(\n\s*if\s*\(\s*!\s*\(\s*file->f_mode\s*&\s*FMODE_READ\s*\)\s*\))', "\n" + hook + r'\1', txt, count=1)
-        rw_p.write_text(txt)
-        print("[OK] Patched fs/read_write.c")
+    if "ksu_handle_sys_read" not in txt:
+        decl = (
+            "#ifdef CONFIG_KSU\n"
+            "extern bool ksu_vfs_read_hook __read_mostly;\n"
+            "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
+            "#endif\n"
+        )
+        hook = (
+            "#ifdef CONFIG_KSU\n"
+            "\tif (unlikely(ksu_vfs_read_hook))\n"
+            "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+            "#endif\n"
+        )
+        m_rd = re.search(r'SYSCALL_DEFINE3\s*\(\s*read\s*,', txt)
+        if m_rd:
+            head = txt[:m_rd.start()] + decl
+            tail = txt[m_rd.start():]
+            tail = re.sub(r'(\n\s*struct\s+fd\s+f\s*=\s*fdget_pos\s*\(\s*fd\s*\)\s*;)', "\n" + hook + r'\1', tail, count=1)
+            rw_p.write_text(head + tail)
+            print("[OK] Hook 3: fs/read_write.c (ksu_handle_sys_read)")
 
-# Hook 4: fs/stat.c
+# Hook 4: fs/stat.c -> ksu_handle_stat
 stat_p = pathlib.Path("fs/stat.c")
-if stat_p.exists() and has_sym("ksu_handle_stat"):
+if stat_p.exists():
     txt = stat_p.read_text()
     if "ksu_handle_stat" not in txt:
         decl = (
@@ -726,72 +652,46 @@ if stat_p.exists() and has_sym("ksu_handle_stat"):
         txt = re.sub(r'(int\s+vfs_fstatat\s*\()', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*\(\s*flag\s*&\s*~\s*\(\s*AT_SYMLINK_NOFOLLOW)', "\n" + hook + r'\1', txt, count=1)
         stat_p.write_text(txt)
-        print("[OK] Patched fs/stat.c")
+        print("[OK] Hook 4: fs/stat.c (ksu_handle_stat)")
 
-# Hook 5: drivers/input/input.c
+# Hook 5: drivers/input/input.c -> ksu_handle_input_handle_event
 inp_p = pathlib.Path("drivers/input/input.c")
-if inp_p.exists() and has_sym("ksu_handle_input_handle_event"):
+if inp_p.exists():
     txt = inp_p.read_text()
     if "ksu_handle_input_handle_event" not in txt:
-        if has_sym("ksu_input_hook"):
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "extern bool ksu_input_hook __read_mostly;\n"
-                "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tif (unlikely(ksu_input_hook))\n"
-                "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
-                "#endif\n"
-            )
-        else:
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tksu_handle_input_handle_event(&type, &code, &value);\n"
-                "#endif\n"
-            )
+        decl = (
+            "#ifdef CONFIG_KSU\n"
+            "extern bool ksu_input_hook __read_mostly;\n"
+            "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+            "#endif\n"
+        )
+        hook = (
+            "#ifdef CONFIG_KSU\n"
+            "\tif (unlikely(ksu_input_hook))\n"
+            "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
+            "#endif\n"
+        )
         txt = re.sub(r'(void\s+input_event\s*\()', decl + r'\1', txt, count=1)
         txt = re.sub(r'(\n\s*if\s*\(\s*is_event_supported\s*\(\s*type\s*,)', "\n" + hook + r'\1', txt, count=1)
         inp_p.write_text(txt)
-        print("[OK] Patched drivers/input/input.c")
+        print("[OK] Hook 5: drivers/input/input.c (ksu_handle_input_handle_event)")
 
-# Hook 6: kernel/sys.c (khusus di dalam SYSCALL_DEFINE3(setresuid))
+# Hook 6: kernel/sys.c -> ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 sys_p = pathlib.Path("kernel/sys.c")
-if sys_p.exists() and has_sym("ksu_handle_setresuid"):
+if sys_p.exists():
     txt = sys_p.read_text()
     if "ksu_handle_setresuid" not in txt:
-        is_ptr = bool(re.search(r'\bksu_handle_setresuid\s*\(\s*uid_t\s*\*', ksu_all))
-        if is_ptr:
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "#include <linux/uidgid.h>\n"
-                "extern int ksu_handle_setresuid(uid_t *ruid, uid_t *euid, uid_t *suid);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tksu_handle_setresuid(&ruid, &euid, &suid);\n"
-                "#endif\n"
-            )
-        else:
-            decl = (
-                "#ifdef CONFIG_KSU\n"
-                "#include <linux/uidgid.h>\n"
-                "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
-                "#endif\n"
-            )
-            hook = (
-                "#ifdef CONFIG_KSU\n"
-                "\tksu_handle_setresuid(ruid, euid, suid);\n"
-                "#endif\n"
-            )
+        decl = (
+            "#ifdef CONFIG_KSU\n"
+            "#include <linux/uidgid.h>\n"
+            "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
+            "#endif\n"
+        )
+        hook = (
+            "#ifdef CONFIG_KSU\n"
+            "\tksu_handle_setresuid(ruid, euid, suid);\n"
+            "#endif\n"
+        )
         m_fn = re.search(r'SYSCALL_DEFINE3\s*\(\s*setresuid\b', txt)
         if m_fn:
             head = txt[:m_fn.start()] + decl
@@ -801,7 +701,30 @@ if sys_p.exists() and has_sym("ksu_handle_setresuid"):
             else:
                 tail = re.sub(r'(\n\s*retval\s*=\s*security_task_fix_setuid\s*\()', "\n" + hook + r'\1', tail, count=1)
             sys_p.write_text(head + tail)
-            print("[OK] Patched kernel/sys.c (setresuid root hook)")
+            print("[OK] Hook 6: kernel/sys.c (ksu_handle_setresuid)")
+
+# Hook 7: kernel/reboot.c -> ksu_handle_sys_reboot (Supercall BakaSU)
+reb_p = pathlib.Path("kernel/reboot.c")
+if reb_p.exists():
+    txt = reb_p.read_text()
+    if "ksu_handle_sys_reboot" not in txt:
+        decl = (
+            "#ifdef CONFIG_KSU\n"
+            "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"
+            "#endif\n"
+        )
+        hook = (
+            "#ifdef CONFIG_KSU\n"
+            "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+            "#endif\n"
+        )
+        m_reb = re.search(r'SYSCALL_DEFINE4\s*\(\s*reboot\b', txt)
+        if m_reb:
+            head = txt[:m_reb.start()] + decl
+            tail = txt[m_reb.start():]
+            tail = re.sub(r'(\n\s*if\s*\(\s*!\s*ns_capable\s*\()', "\n" + hook + r'\1', tail, count=1)
+            reb_p.write_text(head + tail)
+            print("[OK] Hook 7: kernel/reboot.c (ksu_handle_sys_reboot supercall)")
 EOF
 
 # 8. Patch kompatibilitas VFS Linux 4.4 untuk fs/nomount
