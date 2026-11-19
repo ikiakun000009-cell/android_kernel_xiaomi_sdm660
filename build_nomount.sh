@@ -117,11 +117,11 @@ MAKE_ARGS=(
 
 make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-# 6. Konversi Kbuild BakaSU + adapter kernel_read/write 4.4 + versi 35300+ + tambalan 4.4.302
+# 6. Konversi Kbuild BakaSU + ekstrak sertifikat APK rilis + adapter 4.4 + versi 35300+
 if [ -d "drivers/kernelsu" ]; then
     echo "[INFO] Menyesuaikan BakaSU untuk arsitektur arm64 dan API Linux 4.4.302..."
     python3 - << 'EOF'
-import os, pathlib, re, subprocess
+import hashlib, json, os, pathlib, re, struct, subprocess, urllib.request
 
 ksu_dir = pathlib.Path("drivers/kernelsu")
 kbuild_f = ksu_dir / "Kbuild"
@@ -296,7 +296,64 @@ exp_size = m_sz.group(1) if m_sz else "0x033b"
 m_hs = re.search(r'(?:KSU_)?EXPECTED_(?:MANAGER_)?HASH\s*(?::?=|=)\s*\\?"?([0-9a-fA-F]{64})', all_ksu_src)
 exp_hash = m_hs.group(1) if m_hs else "0000000000000000000000000000000000000000000000000000000000000000"
 
-print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Custom Size: {exp_size}")
+# Ekstrak langsung sertifikat v2/v3 dari APK Rilis resmi Baka-SU agar verifikasi root 100% cocok
+def extract_apk_v2_cert(apk_bytes):
+    eocd_pos = apk_bytes.rfind(b"\x50\x4b\x05\x06")
+    if eocd_pos < 24:
+        return None
+    cd_offset = struct.unpack("<I", apk_bytes[eocd_pos + 16:eocd_pos + 20])[0]
+    if cd_offset < 24 or apk_bytes[cd_offset - 16:cd_offset] != b"APK Sig Block 42":
+        return None
+    block_size = struct.unpack("<Q", apk_bytes[cd_offset - 24:cd_offset - 16])[0]
+    block_start = cd_offset - 8 - block_size
+    pos = block_start + 8
+    end = cd_offset - 24
+    while pos + 12 <= end:
+        pair_len, pair_id = struct.unpack("<QI", apk_bytes[pos:pos + 12])
+        val = apk_bytes[pos + 12:pos + 8 + pair_len]
+        if pair_id in (0x7109871a, 0xf05368c0) and len(val) >= 12:
+            signers_len = struct.unpack("<I", val[0:4])[0]
+            signer_len = struct.unpack("<I", val[4:8])[0]
+            signer = val[8:8 + signer_len]
+            signed_data_len = struct.unpack("<I", signer[0:4])[0]
+            signed_data = signer[4:4 + signed_data_len]
+            digests_len = struct.unpack("<I", signed_data[0:4])[0]
+            certs_off = 4 + digests_len
+            certs_len = struct.unpack("<I", signed_data[certs_off:certs_off + 4])[0]
+            first_cert_len = struct.unpack("<I", signed_data[certs_off + 4:certs_off + 8])[0]
+            cert_der = signed_data[certs_off + 8:certs_off + 8 + first_cert_len]
+            return hex(len(cert_der)), hashlib.sha256(cert_der).hexdigest()
+        pos += 8 + pair_len
+    return None
+
+try:
+    req = urllib.request.Request(
+        "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=5",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        releases = json.loads(resp.read().decode())
+    apk_url = None
+    for rel in releases:
+        for asset in rel.get("assets", []):
+            name = asset.get("name", "")
+            if name.endswith("-release.apk") and ("arm64" in name or "universal" in name):
+                apk_url = asset["browser_download_url"]
+                break
+        if apk_url:
+            break
+    if apk_url:
+        print(f"[INFO] Mengunduh APK rilis untuk ekstrak sertifikat: {apk_url}")
+        with urllib.request.urlopen(apk_url, timeout=30) as aresp:
+            apk_data = aresp.read()
+        cert_info = extract_apk_v2_cert(apk_data)
+        if cert_info:
+            exp_size, exp_hash = cert_info
+            print(f"[OK] Sertifikat BakaSU Release terekstrak -> SIZE={exp_size}, HASH={exp_hash}")
+except Exception as e:
+    print(f"[WARN] Lewati auto-ekstrak APK rilis ({e}), memakai kunci bawaan.")
+
+print(f"[OK] BakaSU Version: {ksu_ver} ({ver_full}), Manager Size: {exp_size}")
 
 # Buat compat/syscall_no.h
 sys_h = ksu_dir / "compat" / "syscall_no.h"
@@ -512,7 +569,7 @@ if apk_sign_f.exists():
             flags=re.M,
         )
     apk_sign_f.write_text(atxt)
-    print("[OK] apk_sign.c disesuaikan (built-in BakaSU manager keys aktif)")
+    print("[OK] apk_sign.c disesuaikan (kunci sertifikat BakaSU aktif)")
 
 # Patch lsm_hook_magic.c agar memakai struct list_head (Linux 4.4) & hapus hook->list.lsm
 lsm_h = pathlib.Path("include/linux/lsm_hooks.h").read_text(errors="ignore")
@@ -618,7 +675,7 @@ if kc_path.exists():
 EOF
 fi
 
-# 7. Terapkan 6 Manual Hooks BakaSU (termasuk setresuid di kernel/sys.c untuk eskalasi root)
+# 7. Terapkan 6 Manual Hooks BakaSU (termasuk setresuid khusus di SYSCALL_DEFINE3(setresuid))
 echo "[INFO] Memasang manual hooks pada fs/, drivers/input/, dan kernel/sys.c..."
 python3 - << 'EOF'
 import pathlib, re
@@ -778,7 +835,7 @@ if inp_p.exists() and has_sym("ksu_handle_input_handle_event"):
         inp_p.write_text(txt)
         print("[OK] Patched drivers/input/input.c")
 
-# Hook 6: kernel/sys.c (setresuid untuk eskalasi UID ke root & profil aplikasi)
+# Hook 6: kernel/sys.c (khusus di dalam SYSCALL_DEFINE3(setresuid))
 sys_p = pathlib.Path("kernel/sys.c")
 if sys_p.exists() and has_sym("ksu_handle_setresuid"):
     txt = sys_p.read_text()
@@ -787,6 +844,7 @@ if sys_p.exists() and has_sym("ksu_handle_setresuid"):
         if is_ptr:
             decl = (
                 "#ifdef CONFIG_KSU\n"
+                "#include <linux/uidgid.h>\n"
                 "extern int ksu_handle_setresuid(uid_t *ruid, uid_t *euid, uid_t *suid);\n"
                 "#endif\n"
             )
@@ -798,6 +856,7 @@ if sys_p.exists() and has_sym("ksu_handle_setresuid"):
         else:
             decl = (
                 "#ifdef CONFIG_KSU\n"
+                "#include <linux/uidgid.h>\n"
                 "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
                 "#endif\n"
             )
@@ -806,13 +865,16 @@ if sys_p.exists() and has_sym("ksu_handle_setresuid"):
                 "\tksu_handle_setresuid(ruid, euid, suid);\n"
                 "#endif\n"
             )
-        txt = re.sub(r'(SYSCALL_DEFINE3\s*\(\s*setresuid\b)', decl + r'\1', txt, count=1)
-        if re.search(r'\n\s*if\s*\(\s*!uid_valid\s*\(\s*kruid\s*\)', txt):
-            txt = re.sub(r'(\n\s*if\s*\(\s*!uid_valid\s*\(\s*kruid\s*\))', "\n" + hook + r'\1', txt, count=1)
-        else:
-            txt = re.sub(r'(\n\s*retval\s*=\s*security_task_fix_setuid\s*\()', "\n" + hook + r'\1', txt, count=1)
-        sys_p.write_text(txt)
-        print("[OK] Patched kernel/sys.c (setresuid root hook)")
+        m_fn = re.search(r'SYSCALL_DEFINE3\s*\(\s*setresuid\b', txt)
+        if m_fn:
+            head = txt[:m_fn.start()] + decl
+            tail = txt[m_fn.start():]
+            if re.search(r'\n\s*if\s*\(\s*!uid_valid\s*\(\s*kruid\s*\)', tail):
+                tail = re.sub(r'(\n\s*if\s*\(\s*!uid_valid\s*\(\s*kruid\s*\))', "\n" + hook + r'\1', tail, count=1)
+            else:
+                tail = re.sub(r'(\n\s*retval\s*=\s*security_task_fix_setuid\s*\()', "\n" + hook + r'\1', tail, count=1)
+            sys_p.write_text(head + tail)
+            print("[OK] Patched kernel/sys.c (setresuid root hook)")
 EOF
 
 # 8. Patch kompatibilitas VFS Linux 4.4 untuk fs/nomount
